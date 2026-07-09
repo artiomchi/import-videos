@@ -13,7 +13,7 @@ First code changeset. The architectural frame is already fixed by ADRs (scan →
 
 **Non-Goals:**
 - Device modules, MP4/GPMF parsing (`src/media/` doesn't exist yet).
-- Progress bars (`indicatif` lands with changeset 5), `cleanup`/`inspect` commands, `--json` output.
+- Progress bars (`indicatif` lands with changeset 5), `cleanup`/`inspect` commands, `--json` output. `serde_json` is declared now (task 1.1) as the forward-declared dependency for `--json`, but is unused until that command lands; unlike `anyhow` (D7), it has a named next use, so it is kept rather than removed.
 - Cross-filesystem rename fallbacks beyond plain copy+delete; parallel transfers.
 
 ## Decisions
@@ -27,7 +27,8 @@ First code changeset. The architectural frame is already fixed by ADRs (scan →
 *Alternative*: a template crate (tinytemplate/handlebars) — no strftime support, heavier dependency for a three-token language.
 
 ### D3. Dispatch over sources: trait objects
-The registry is `Vec<Box<dyn ImportSource>>`, built from the profiles present in config. Trait objects (vs. an enum of sources) keep device modules open for extension without touching core, and dyn dispatch cost is irrelevant at "files per card" scale. This is a designated learning topic (trait objects vs. generics note in `docs/learning/`).
+Device dispatch is via `Box<dyn ImportSource>`: `SourceKind::build()` maps a profile's `type` to its implementation. Trait objects (vs. an enum of sources) keep device modules open for extension without touching core, and dyn dispatch cost is irrelevant at "files per card" scale. This is a designated learning topic (trait objects vs. generics note in `docs/learning/`).
+The mapping is an exhaustive `match` on `SourceKind` rather than a runtime `Vec`/`HashMap` registry: the device set is fixed at compile time, so the compiler forces the match to be updated whenever a variant is added — a guarantee a runtime registry can't give. Each `scan`/`import` invocation names one profile, so the pipeline builds exactly one source rather than a collection.
 
 ### D4. Plan is data, execution consumes it
 `scan` produces `ImportPlan { actions: Vec<PlannedAction> }`, where each `PlannedAction` pairs a `MediaGroup` with its `Verdict` and *fully resolved* destination/quarantine paths. Execution takes the plan and does nothing clever — every decision is visible in `scan`/`--dry-run` output verbatim. Re-running is idempotent: a destination file with matching blake3 counts as already-imported (skip; still eligible for source deletion).
@@ -38,10 +39,11 @@ Collision with *different* content at the destination: keep both — append `-1`
 *Alternative*: trust the copy and hash only once — cheaper, but misses write-side corruption, and verify-then-delete is the whole safety contract (ADR 0003).
 
 ### D6. `source: auto` probes mount roots
-A locator walks candidate mount roots (`/run/media/<user>`, `/media`, `/mnt`; overridable via top-level `mount_roots` config) and offers each mounted volume to every profile's `detect()`. Explicit `source: <path>` skips probing. Core ships the locator; it finds nothing until device modules implement `detect()`.
+A locator walks candidate mount roots (`/run/media/<user>`, `/media`, `/mnt`; overridable via top-level `mount_roots` config) and offers each mounted volume to the selected profile's `detect()` — an invocation names one profile (`scan gopro`), so probing is scoped to that profile's device implementation (matches spec: "volumes accepted by the device implementation's `detect()`"). Explicit `source: <path>` skips probing. Core ships the locator; it finds nothing until device modules implement `detect()`.
 
-### D7. Errors: thiserror enum in lib, anyhow in main
-Library error type carries path context (`Io { path, source }`, `Config`, `VerifyMismatch { src, dest }`, `Template`), so messages name the file that failed. `main.rs` converts to `anyhow` for display and maps to exit codes: 0 success (including "nothing to import"), 1 failure, 2 config/usage error.
+### D7. Errors: thiserror enum in lib, typed error displayed at the boundary
+Library error type carries path context (`Io { path, source }`, `Config`, `VerifyMismatch { src, dest }`, `Template`), so messages name the file that failed. `lib.rs::run()` is the single boundary: it prints the error's `Display` and maps the variant to an exit code via `Error::exit_code()` — 0 success (including "nothing to import"), 1 failure, 2 config/usage error. `main.rs` stays a one-liner (`std::process::exit(run())`).
+`anyhow` is deliberately *not* used: it earns its place at a binary's outer layer that has its own fallible setup (reading an env var, say), and this `main.rs` has none — so the crate depends on `thiserror` only, and `anyhow` is deferred until such a need appears. See `docs/learning/errors-thiserror-vs-anyhow.md`.
 
 ### D8. Confirmation prompts via std
 Destructive steps prompt on stdin unless `--yes`; non-interactive stdin (not a tty) without `--yes` aborts rather than assumes. Plain `std::io` — no dialoguer dependency for one y/N prompt.

@@ -12,4 +12,6 @@ Keep notes under a page. Link related ADRs.
 
 ## Index
 
-*(empty — notes land with the changesets that introduce them)*
+- [thiserror vs. anyhow](errors-thiserror-vs-anyhow.md) — library error types vs. binary-boundary error handling
+- [lib.rs + thin main.rs](lib-bin-split.md) — why the logic lives in a testable library, not the binary
+- [Trait objects vs. generics](trait-objects-vs-generics.md) — why `ImportSource` dispatch uses `Box<dyn Trait>`
