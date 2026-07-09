@@ -82,7 +82,7 @@ pub fn build_plan(
     source_impl: &dyn ImportSource,
     source_root: &Path,
 ) -> Result<ImportPlan> {
-    let groups = source_impl.scan(source_root)?;
+    let groups = source_impl.scan(source_root, &profile.ignore)?;
     let mut actions = Vec::with_capacity(groups.len());
 
     for (group, verdict) in groups {

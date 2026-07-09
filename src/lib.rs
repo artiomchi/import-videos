@@ -5,6 +5,7 @@
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod media;
 pub mod plan;
 pub mod report;
 pub mod source;
@@ -41,16 +42,25 @@ fn run_inner(cli: Cli) -> Result<ExitCode> {
             .ok_or_else(|| Error::Config("could not determine the default config path".into()))?,
     };
     let cfg = config::load(&config_path)?;
+    let verbose = cli.verbose > 0;
 
     match cli.command {
-        Command::Scan { profile, source } => run_scan(&cfg, &profile, source.as_deref()),
+        Command::Scan { profile, source } => run_scan(&cfg, &profile, source.as_deref(), verbose),
         Command::Import {
             profile,
             source,
             dry_run,
             keep_source,
             yes,
-        } => run_import(&cfg, &profile, source.as_deref(), dry_run, keep_source, yes),
+        } => run_import(
+            &cfg,
+            &profile,
+            source.as_deref(),
+            dry_run,
+            keep_source,
+            yes,
+            verbose,
+        ),
     }
 }
 
@@ -93,12 +103,13 @@ fn run_scan(
     cfg: &config::Config,
     profile_name: &str,
     source_override: Option<&Path>,
+    verbose: bool,
 ) -> Result<ExitCode> {
     match scan_profile(cfg, profile_name, source_override)? {
         None => {
             println!("no sources found for profile '{profile_name}'");
         }
-        Some(import_plan) => print!("{}", report::render_plan(&import_plan)),
+        Some(import_plan) => print!("{}", report::render_plan(&import_plan, verbose)),
     }
     Ok(ExitCode::Success)
 }
@@ -110,6 +121,7 @@ fn run_import(
     dry_run: bool,
     keep_source_flag: bool,
     assume_yes: bool,
+    verbose: bool,
 ) -> Result<ExitCode> {
     let profile = get_profile(cfg, profile_name)?;
 
@@ -119,7 +131,7 @@ fn run_import(
     };
 
     if dry_run {
-        print!("{}", report::render_plan(&import_plan));
+        print!("{}", report::render_plan(&import_plan, verbose));
         return Ok(ExitCode::Success);
     }
 
@@ -135,6 +147,10 @@ fn run_import(
         g.files
             .iter()
             .any(|f| matches!(f.outcome, transfer::TransferOutcome::Failed(_)))
+            || matches!(
+                g.sidecar_outcome,
+                Some(transfer::TransferOutcome::Failed(_))
+            )
     });
 
     Ok(if any_failed {

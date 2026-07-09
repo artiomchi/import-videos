@@ -17,7 +17,7 @@ The author is an experienced .NET developer learning Rust. This shapes how code 
 
 - **Idiomatic Rust first.** Prefer the way a seasoned Rust developer would write it, even when a .NET-flavored approach would be shorter. The point is to learn the idioms.
 - **Instructive doc comments, no noise.** When code uses a Rust concept that is non-obvious to someone coming from C# (ownership hand-offs, lifetimes, trait objects vs. generics, error design), a short doc comment explaining *why the code is shaped this way* is welcome. Comments that narrate what the next line does are not.
-- **Prefer std and few, well-chosen crates.** Hand-rolling the MP4 box walker and GPMF parser is intentional (see ADR 0002 once written) — binary parsing is prime learning material and the existing crates are unmaintained.
+- **Prefer std and few, well-chosen crates.** Hand-rolling the MP4 box walker and GPMF parser is intentional (see ADR 0002) — binary parsing is prime learning material and the existing crates are unmaintained.
 - **Capture learning notes.** When a change introduces a Rust concept new to this codebase, add or extend a note in `docs/learning/` tying the concept to the concrete code that uses it. See `docs/learning/README.md` for the format.
 
 ## Decisions live in ADRs

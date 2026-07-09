@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use crate::error::{Error, Result};
 use crate::plan::ImportPlan;
-use crate::source::Verdict;
+use crate::source::{Sidecar, Verdict};
 
 const BUF_SIZE: usize = 64 * 1024;
 
@@ -35,6 +35,10 @@ pub struct GroupResult {
     pub group_name: String,
     pub verdict: Verdict,
     pub files: Vec<FileResult>,
+    /// Outcome of writing the group's sidecar, if it had one (design
+    /// D6). Kept separate from `files` because a sidecar isn't a
+    /// source file: it must never be treated as a deletion candidate.
+    pub sidecar_outcome: Option<TransferOutcome>,
     pub deleted_from_source: bool,
 }
 
@@ -51,6 +55,13 @@ fn outcome_is_success(outcome: &TransferOutcome) -> bool {
             | TransferOutcome::SkippedIdentical
             | TransferOutcome::Suffixed(_)
     )
+}
+
+/// A group with no sidecar has nothing to fail; one that wrote its
+/// sidecar successfully is fine too — only an explicit write failure
+/// blocks deletion (spec: "Sidecar failure blocks source deletion").
+fn sidecar_ok(outcome: &Option<TransferOutcome>) -> bool {
+    !matches!(outcome, Some(TransferOutcome::Failed(_)))
 }
 
 /// Executes every planned action: transfers `Keep` groups to their
@@ -86,26 +97,40 @@ pub fn execute(
             }
         }
 
+        // Sidecar is written only once every file in the group has
+        // transferred and verified (spec: "written ... only after all
+        // of the session's files transferred and verified").
+        let all_files_ok =
+            !files.is_empty() && files.iter().all(|f| outcome_is_success(&f.outcome));
+        let sidecar_outcome = match (target_dir, &action.group.sidecar) {
+            (Some(dir), Some(sidecar)) if all_files_ok => Some(write_sidecar(dir, sidecar)),
+            _ => None,
+        };
+
         groups.push(GroupResult {
             group_name: action.group.name.clone(),
             verdict: action.verdict.clone(),
             files,
+            sidecar_outcome,
             deleted_from_source: false,
         });
     }
 
     let mut deletion_skipped_reason = None;
     if delete_source && !keep_source {
-        let any_eligible = groups
-            .iter()
-            .any(|g| !g.files.is_empty() && g.files.iter().all(|f| outcome_is_success(&f.outcome)));
+        let any_eligible = groups.iter().any(|g| {
+            !g.files.is_empty()
+                && g.files.iter().all(|f| outcome_is_success(&f.outcome))
+                && sidecar_ok(&g.sidecar_outcome)
+        });
 
         if any_eligible {
             match confirm_deletion(assume_yes)? {
                 Confirmation::Confirmed => {
                     for group in &mut groups {
                         let all_ok = !group.files.is_empty()
-                            && group.files.iter().all(|f| outcome_is_success(&f.outcome));
+                            && group.files.iter().all(|f| outcome_is_success(&f.outcome))
+                            && sidecar_ok(&group.sidecar_outcome);
                         if all_ok {
                             for file in &group.files {
                                 let _ = fs::remove_file(&file.src);
@@ -170,6 +195,27 @@ fn parse_confirmation(line: &str) -> Confirmation {
         "y" | "yes" => Confirmation::Confirmed,
         _ => Confirmation::DeclinedInteractive,
     }
+}
+
+/// Writes a group's sidecar into its already-transferred target
+/// directory. Failure never propagates — it becomes a `Failed`
+/// outcome so the caller can keep processing the rest of the plan and
+/// so it participates in `sidecar_ok`'s deletion gate.
+fn write_sidecar(dir: &Path, sidecar: &Sidecar) -> TransferOutcome {
+    match write_sidecar_inner(dir, sidecar) {
+        Ok(()) => TransferOutcome::Transferred,
+        Err(e) => TransferOutcome::Failed(e.to_string()),
+    }
+}
+
+fn write_sidecar_inner(dir: &Path, sidecar: &Sidecar) -> Result<()> {
+    let path = dir.join(&sidecar.filename);
+    // `Sidecar::content` is always built from our own String-keyed,
+    // finite-valued structures, so serialization cannot fail in
+    // practice.
+    let bytes = serde_json::to_vec_pretty(&sidecar.content)
+        .expect("sidecar content is always representable as JSON");
+    fs::write(&path, bytes).map_err(|e| Error::io(&path, e))
 }
 
 /// Streams `src` to `<final>.part` under `dest_dir` while hashing the
@@ -304,6 +350,28 @@ fn hash_file(path: &Path) -> Result<blake3::Hash> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::plan::PlannedAction;
+    use crate::source::{MediaFile, MediaGroup};
+    use std::collections::HashMap;
+
+    fn ts(secs: i64) -> jiff::Timestamp {
+        jiff::Timestamp::from_second(secs).unwrap()
+    }
+
+    fn group_with_sidecar(path: &Path, sidecar: Sidecar) -> MediaGroup {
+        MediaGroup {
+            name: "session".to_string(),
+            files: vec![MediaFile {
+                path: path.to_path_buf(),
+                size: 7,
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: Some(sidecar),
+        }
+    }
 
     #[test]
     fn confirmation_accepts_only_yes_variants() {
@@ -352,6 +420,72 @@ mod tests {
 
         let outcome = transfer_file(&src, &dest_dir).unwrap();
         assert_eq!(outcome, TransferOutcome::SkippedIdentical);
+    }
+
+    #[test]
+    fn sidecar_written_on_success() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"footage").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let sidecar = Sidecar {
+            filename: "markers.json".to_string(),
+            content: serde_json::json!({"camera": "gopro-hero8"}),
+        };
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group: group_with_sidecar(&src, sidecar),
+                verdict: Verdict::Keep,
+                destination: Some(dest_dir.clone()),
+                quarantine_path: None,
+            }],
+        };
+
+        let report = execute(&plan, false, false, false).unwrap();
+
+        assert!(matches!(
+            report.groups[0].sidecar_outcome,
+            Some(TransferOutcome::Transferred)
+        ));
+        let content: serde_json::Value =
+            serde_json::from_slice(&fs::read(dest_dir.join("markers.json")).unwrap()).unwrap();
+        assert_eq!(content, serde_json::json!({"camera": "gopro-hero8"}));
+    }
+
+    #[test]
+    fn sidecar_failure_blocks_source_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"footage").unwrap();
+        let dest_dir = dir.path().join("dest");
+        // Occupy the sidecar's path with a directory so the write fails.
+        fs::create_dir_all(dest_dir.join("markers.json")).unwrap();
+
+        let sidecar = Sidecar {
+            filename: "markers.json".to_string(),
+            content: serde_json::json!({}),
+        };
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group: group_with_sidecar(&src, sidecar),
+                verdict: Verdict::Keep,
+                destination: Some(dest_dir.clone()),
+                quarantine_path: None,
+            }],
+        };
+
+        let report = execute(&plan, true, false, true).unwrap();
+
+        assert!(matches!(
+            report.groups[0].sidecar_outcome,
+            Some(TransferOutcome::Failed(_))
+        ));
+        assert!(!report.groups[0].deleted_from_source);
+        assert!(
+            src.exists(),
+            "source must be retained when the sidecar fails to write"
+        );
     }
 
     #[test]

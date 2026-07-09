@@ -37,7 +37,11 @@ impl ImportSource for TestSource {
         true
     }
 
-    fn scan(&self, _root: &Path) -> error::Result<Vec<(MediaGroup, Verdict)>> {
+    fn scan(
+        &self,
+        _root: &Path,
+        _ignore: &globset::GlobSet,
+    ) -> error::Result<Vec<(MediaGroup, Verdict)>> {
         Ok(self.groups.clone())
     }
 }
@@ -78,6 +82,7 @@ fn group(name: &str, files: Vec<MediaFile>) -> MediaGroup {
         markers: vec![],
         geo: None,
         context: HashMap::new(),
+        sidecar: None,
     }
 }
 

@@ -5,7 +5,7 @@ Lightweight MADR format: **Context / Decision / Consequences**. An ADR is writte
 | ADR | Title | Status |
 |---|---|---|
 | [0001](0001-rust-as-learning-project.md) | Rust as a learning project | accepted |
-| 0002 | Hand-rolled MP4 and GPMF parsers | *reserved — written with the `add-gopro-import` changeset* |
+| [0002](0002-hand-rolled-mp4-and-gpmf-parsers.md) | Hand-rolled MP4 and GPMF parsers | accepted |
 | [0003](0003-scan-plan-execute-safety-model.md) | Scan → plan → execute safety model | accepted |
 | [0004](0004-yaml-config-with-profile-per-device.md) | YAML config with a profile per device | accepted |
 | [0005](0005-single-crate-trait-based-extensibility.md) | Single crate, trait-based extensibility | accepted |

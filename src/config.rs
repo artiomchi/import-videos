@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 pub use layout::LayoutTemplate;
 
 use crate::error::{Error, Result};
+use crate::source::gopro::GoproSource;
 use crate::source::{GenericSource, ImportSource};
 
 /// Device-specific profile fields, an internally tagged enum on `type`
@@ -23,16 +24,25 @@ use crate::source::{GenericSource, ImportSource};
 /// which is how "unknown profile type" (spec) gets its exit-2 error
 /// without extra validation code of our own.
 ///
-/// This changeset ships no device modules yet (ADR 0005) — `Generic`
-/// is the zero-extra-fields placeholder that exercises the flatten +
-/// internally-tagged-enum mechanism (design Risks) and lets `scan`
-/// run the pipeline end-to-end. `add-gopro-import` / `add-tesla-import`
-/// each add a sibling variant here plus an `ImportSource` impl under
-/// `src/source/`.
+/// `Generic` is the zero-extra-fields placeholder from `add-core-cli`
+/// that exercises the flatten + internally-tagged-enum mechanism
+/// (design Risks). `Gopro` is the first real device (design D1):
+/// `require_marker` is a device-specific knob that rides on the
+/// variant itself rather than polluting the common `Profile` surface.
+/// `add-tesla-import` adds a sibling variant here plus an
+/// `ImportSource` impl under `src/source/`.
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SourceKind {
     Generic,
+    Gopro {
+        #[serde(default = "default_require_marker")]
+        require_marker: bool,
+    },
+}
+
+fn default_require_marker() -> bool {
+    true
 }
 
 impl SourceKind {
@@ -45,6 +55,9 @@ impl SourceKind {
     pub fn build(&self) -> Box<dyn ImportSource> {
         match self {
             SourceKind::Generic => Box::new(GenericSource),
+            SourceKind::Gopro { require_marker } => Box::new(GoproSource {
+                require_marker: *require_marker,
+            }),
         }
     }
 }
@@ -80,8 +93,13 @@ pub struct Config {
 struct RawConfig {
     #[serde(default)]
     mount_roots: Option<Vec<String>>,
+    // Kept as raw YAML values, not `RawProfile`, so `load` can check
+    // for `require_marker` on the wrong device type before that field
+    // gets silently swallowed by the flattened, internally-tagged
+    // `SourceKind` enum (a unit variant like `Generic` ignores extra
+    // content rather than rejecting it — design Risks).
     #[serde(default)]
-    profiles: HashMap<String, RawProfile>,
+    profiles: HashMap<String, serde_yaml_ng::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -133,7 +151,21 @@ pub fn load(path: &Path) -> Result<Config> {
         .collect();
 
     let mut profiles = HashMap::with_capacity(raw.profiles.len());
-    for (name, raw_profile) in raw.profiles {
+    for (name, raw_value) in raw.profiles {
+        let has_require_marker = raw_value
+            .as_mapping()
+            .map(|m| m.get("require_marker").is_some())
+            .unwrap_or(false);
+
+        let raw_profile: RawProfile = serde_yaml_ng::from_value(raw_value)
+            .map_err(|e| Error::Config(format!("profile '{name}': {e}")))?;
+
+        if has_require_marker && !matches!(raw_profile.kind, SourceKind::Gopro { .. }) {
+            return Err(Error::Config(format!(
+                "profile '{name}': require_marker is only valid for profiles of type gopro"
+            )));
+        }
+
         let profile = validate_profile(&name, raw_profile)?;
         profiles.insert(name, profile);
     }
@@ -157,13 +189,29 @@ fn validate_profile(name: &str, raw: RawProfile) -> Result<Profile> {
     let ignore = build_globset(&raw.ignore)
         .map_err(|e| Error::Config(format!("profile '{name}': ignore: {e}")))?;
 
+    let destination = expand_tilde(&raw.destination);
+    // A relative `quarantine` (e.g. `./_quarantine`) is resolved against
+    // `destination`, not the process's current directory — the profile
+    // already implies "relative to where kept footage lands" via the
+    // unset-quarantine default (`destination.join("_quarantine")`), so an
+    // explicit relative path follows the same rule instead of depending on
+    // wherever the CLI happened to be invoked from.
+    let quarantine = raw.quarantine.map(|s| {
+        let path = expand_tilde(&s);
+        if path.is_absolute() {
+            path
+        } else {
+            destination.join(path)
+        }
+    });
+
     Ok(Profile {
         kind: raw.kind,
         source,
-        destination: expand_tilde(&raw.destination),
+        destination,
         layout,
         ignore,
-        quarantine: raw.quarantine.map(|s| expand_tilde(&s)),
+        quarantine,
         delete_source: raw.delete_source,
     })
 }
@@ -227,6 +275,47 @@ profiles:
         assert_eq!(profile.kind, SourceKind::Generic);
         assert_eq!(profile.source, SourceLocation::Auto);
         assert!(profile.delete_source);
+    }
+
+    #[test]
+    fn relative_quarantine_resolves_against_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  cam:\n    type: generic\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n    quarantine: ./_quarantine\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = load(&path).unwrap();
+        let profile = cfg.profiles.get("cam").unwrap();
+        assert_eq!(
+            profile.quarantine,
+            Some(dir.path().join("dest").join("_quarantine"))
+        );
+    }
+
+    #[test]
+    fn absolute_quarantine_is_left_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let quarantine_path = dir.path().join("elsewhere/_quarantine");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  cam:\n    type: generic\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n    quarantine: {}\n",
+                dir.path().join("dest").display(),
+                quarantine_path.display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = load(&path).unwrap();
+        let profile = cfg.profiles.get("cam").unwrap();
+        assert_eq!(profile.quarantine, Some(quarantine_path));
     }
 
     #[test]
@@ -298,5 +387,70 @@ profiles:
         let yaml = serde_yaml_ng::to_string(&original).unwrap();
         let round_tripped: RawProfile = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(original, round_tripped);
+    }
+
+    #[test]
+    fn gopro_variant_serde_round_trips() {
+        // Same risk as the Generic round-trip above, but for a variant
+        // that actually carries a field (design D1) — the flatten +
+        // internally-tagged-enum combination is exactly where that's
+        // most likely to misbehave.
+        let original = RawProfile {
+            kind: SourceKind::Gopro {
+                require_marker: false,
+            },
+            source: "auto".to_string(),
+            destination: "/tmp/dest".to_string(),
+            layout: "{date}".to_string(),
+            ignore: vec!["*.LRV".to_string()],
+            quarantine: None,
+            delete_source: false,
+        };
+
+        let yaml = serde_yaml_ng::to_string(&original).unwrap();
+        let round_tripped: RawProfile = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(original, round_tripped);
+    }
+
+    #[test]
+    fn require_marker_rejected_on_non_gopro_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  cam:\n    type: generic\n    require_marker: false\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&path).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("cam"));
+        assert!(err.to_string().contains("require_marker"));
+        assert_eq!(err.exit_code(), crate::error::ExitCode::UsageOrConfig);
+    }
+
+    #[test]
+    fn gopro_profile_defaults_require_marker_to_true() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  gopro:\n    type: gopro\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = load(&path).unwrap();
+        assert_eq!(
+            cfg.profiles.get("gopro").unwrap().kind,
+            SourceKind::Gopro {
+                require_marker: true
+            }
+        );
     }
 }

@@ -2,10 +2,13 @@
 //! core pipeline (ADR 0005). Core defines the contract; it contains no
 //! device-specific logic itself.
 
+pub mod gopro;
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 
+use globset::GlobSet;
 use jiff::Timestamp;
 
 use crate::error::Result;
@@ -26,6 +29,16 @@ pub struct Marker {
     pub label: Option<String>,
 }
 
+/// A device-authored metadata file planned alongside a group's media
+/// (e.g. GoPro's `markers.json`, design D6). Attached during `scan` so
+/// it is visible in the plan before anything is written; the transfer
+/// engine writes it, after the group's files transfer and verify.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Sidecar {
+    pub filename: String,
+    pub content: serde_json::Value,
+}
+
 /// One unit of import planning: a set of related files (e.g. all the
 /// chapter files for one recording session) sharing a timestamp and,
 /// optionally, a location. `context` supplies the values that layout
@@ -38,6 +51,7 @@ pub struct MediaGroup {
     pub markers: Vec<Marker>,
     pub geo: Option<(f64, f64)>,
     pub context: HashMap<String, String>,
+    pub sidecar: Option<Sidecar>,
 }
 
 /// What the pipeline should do with a `MediaGroup`, decided by the
@@ -60,9 +74,12 @@ pub trait ImportSource {
     fn detect(&self, root: &Path) -> bool;
 
     /// Discovers media under `root`, grouping files and assigning a
-    /// verdict to each group. Must not modify anything under `root`
-    /// (spec: "Scan produces a reviewable plan without side effects").
-    fn scan(&self, root: &Path) -> Result<Vec<(MediaGroup, Verdict)>>;
+    /// verdict to each group. `ignore` is the profile's common
+    /// ignore-glob set (design D2): a device applies it during
+    /// discovery so an ignored file is never opened, let alone parsed.
+    /// Must not modify anything under `root` (spec: "Scan produces a
+    /// reviewable plan without side effects").
+    fn scan(&self, root: &Path, ignore: &GlobSet) -> Result<Vec<(MediaGroup, Verdict)>>;
 }
 
 /// Placeholder `ImportSource`: never detects a card and never finds
@@ -77,7 +94,7 @@ impl ImportSource for GenericSource {
         false
     }
 
-    fn scan(&self, _root: &Path) -> Result<Vec<(MediaGroup, Verdict)>> {
+    fn scan(&self, _root: &Path, _ignore: &GlobSet) -> Result<Vec<(MediaGroup, Verdict)>> {
         Ok(Vec::new())
     }
 }
