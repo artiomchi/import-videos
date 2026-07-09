@@ -1,20 +1,30 @@
 schema: spec-driven
 
-# Project context (optional)
-# This is shown to AI when creating artifacts.
-# Add your tech stack, conventions, style guides, domain knowledge, etc.
-# Example:
-#   context: |
-#     Tech stack: TypeScript, React, Node.js
-#     We use conventional commits
-#     Domain: e-commerce platform
+context: |
+  import-videos: a Rust CLI that imports footage from camera storage (GoPro SD cards,
+  Tesla dashcam USB drives) into a date-organized library, keeping only footage that
+  device metadata marks as worth keeping (GoPro HiLight tags, Tesla event triggers).
 
-# Per-artifact rules (optional)
-# Add custom rules for specific artifacts.
-# Example:
-#   rules:
-#     proposal:
-#       - Keep proposals under 500 words
-#       - Always include a "Non-goals" section
-#     tasks:
-#       - Break tasks into chunks of max 2 hours
+  Tech stack: Rust (single crate, lib + thin bin). clap (derive), serde + serde_yaml_ng
+  + serde_json, jiff (dates), blake3 (verify), globset, indicatif, tracing;
+  thiserror in the library, anyhow at the binary boundary.
+
+  Architecture: every import is scan -> plan -> execute (ADR 0003). Device types
+  implement the ImportSource trait in src/source/ (ADR 0005); binary format parsing
+  (MP4 boxes, GPMF) is hand-rolled in src/media/. YAML config with a profile per
+  device (ADR 0004).
+
+  Conventions (see AGENTS.md):
+  - This is a Rust learning project for an experienced .NET developer (ADR 0001):
+    idiomatic Rust, instructive doc comments only, learning notes in docs/learning/.
+  - Significant decisions get an ADR in docs/adr/; check ADRs before re-deciding.
+  - Quality gates: cargo test, cargo clippy -- -D warnings, cargo fmt --check.
+  - Anything that deletes/overwrites footage sits behind the plan/execute split and
+    has an integration test.
+
+rules:
+  proposal:
+    - Reference relevant ADRs instead of restating their reasoning
+  tasks:
+    - Include a task for learning notes / ADRs when the change introduces new Rust concepts or decisions
+    - Include quality-gate task (test, clippy -D warnings, fmt --check)
