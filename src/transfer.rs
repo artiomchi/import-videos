@@ -23,6 +23,12 @@ pub enum TransferOutcome {
     Transferred,
     SkippedIdentical,
     Suffixed(PathBuf),
+    /// The file belongs to a `Quarantine` group whose profile has
+    /// `copy_quarantine: false` — it was deliberately left in place
+    /// on the source with no copy made. Because no transfer occurred,
+    /// this outcome MUST NOT count as a success and MUST NOT make the
+    /// group a source-deletion candidate.
+    SkippedQuarantineDisabled,
     Failed(String),
 }
 
@@ -55,7 +61,9 @@ fn outcome_is_success(outcome: &TransferOutcome) -> bool {
         outcome,
         TransferOutcome::Transferred
             | TransferOutcome::SkippedIdentical
-            | TransferOutcome::Suffixed(_)
+            | TransferOutcome::Suffixed(_) // SkippedQuarantineDisabled is intentionally excluded: a file
+                                           // left in place is never a verified transfer, so its group
+                                           // must never become a source-deletion candidate.
     )
 }
 
@@ -79,6 +87,28 @@ pub fn execute(
     keep_source: bool,
     assume_yes: bool,
 ) -> Result<ExecuteReport> {
+    // The one place we consult the ambient terminal: whether stdin is
+    // interactive is what decides if a missing `--yes` prompts or
+    // safely skips deletion. Threading it into `execute_inner` as a
+    // plain `bool` keeps that global dependency at the edge, so the
+    // deletion gate stays deterministic to test without a real tty —
+    // and an in-process test can never hang waiting on stdin.
+    execute_inner(
+        plan,
+        delete_source,
+        keep_source,
+        assume_yes,
+        io::stdin().is_terminal(),
+    )
+}
+
+fn execute_inner(
+    plan: &ImportPlan,
+    delete_source: bool,
+    keep_source: bool,
+    assume_yes: bool,
+    stdin_is_terminal: bool,
+) -> Result<ExecuteReport> {
     let mut groups = Vec::with_capacity(plan.actions.len());
 
     for action in &plan.actions {
@@ -95,6 +125,15 @@ pub fn execute(
                 files.push(FileResult {
                     src: media_file.path.clone(),
                     outcome,
+                });
+            }
+        } else if matches!(action.verdict, Verdict::Quarantine) {
+            // copy_quarantine: false — record each file as left in
+            // place; no filesystem access whatsoever.
+            for media_file in &action.group.files {
+                files.push(FileResult {
+                    src: media_file.path.clone(),
+                    outcome: TransferOutcome::SkippedQuarantineDisabled,
                 });
             }
         }
@@ -127,7 +166,7 @@ pub fn execute(
         });
 
         if any_eligible {
-            match confirm_deletion(assume_yes)? {
+            match confirm_deletion(assume_yes, stdin_is_terminal)? {
                 Confirmation::Confirmed => {
                     for group in &mut groups {
                         let all_ok = !group.files.is_empty()
@@ -170,11 +209,11 @@ enum Confirmation {
 /// Destructive steps prompt on stdin unless `--yes` is passed;
 /// non-interactive stdin without `--yes` aborts rather than assumes
 /// (design D8, spec: "Destructive steps require confirmation").
-fn confirm_deletion(assume_yes: bool) -> Result<Confirmation> {
+fn confirm_deletion(assume_yes: bool, stdin_is_terminal: bool) -> Result<Confirmation> {
     if assume_yes {
         return Ok(Confirmation::Confirmed);
     }
-    if !io::stdin().is_terminal() {
+    if !stdin_is_terminal {
         return Ok(Confirmation::SkippedNonInteractive);
     }
     print!("Delete source files now that they are safely imported? [y/N] ");
@@ -429,6 +468,49 @@ mod tests {
                 "{input:?} should decline"
             );
         }
+    }
+
+    #[test]
+    fn non_interactive_without_yes_skips_deletion() {
+        // spec: "Destructive steps require confirmation" — with
+        // `delete_source` but no `--yes` and a non-interactive stdin,
+        // deletion is skipped rather than assumed. `stdin_is_terminal`
+        // is injected as `false` so the behaviour is deterministic
+        // regardless of how the test runner wires stdin (calling the
+        // public `execute` here would read the real terminal and block
+        // on the `[y/N]` prompt).
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"footage").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let group = MediaGroup {
+            name: "a".to_string(),
+            files: vec![MediaFile {
+                path: src.clone(),
+                size: 7,
+                recorded_at: None,
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group,
+                verdict: Verdict::Keep,
+                destination: Some(dest_dir.clone()),
+                quarantine_path: None,
+            }],
+        };
+
+        let report = execute_inner(&plan, true, false, false, false).unwrap();
+
+        assert!(src.exists(), "deletion must be skipped, not assumed");
+        assert!(!report.groups[0].deleted_from_source);
+        assert!(report.deletion_skipped_reason.is_some());
     }
 
     #[test]

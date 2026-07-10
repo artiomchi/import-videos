@@ -92,6 +92,12 @@ pub struct Profile {
     pub ignore: GlobSet,
     pub quarantine: Option<PathBuf>,
     pub delete_source: bool,
+    /// When `false`, `Quarantine` groups are never copied; their source
+    /// files are left exactly where they are. The `Quarantine` verdict
+    /// is still produced and reported — only what execution does with
+    /// it changes. Defaults to `true` (verified-copy behavior, ADR
+    /// 0003) when omitted from the YAML.
+    pub copy_quarantine: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +133,12 @@ struct RawProfile {
     quarantine: Option<String>,
     #[serde(default)]
     delete_source: bool,
+    #[serde(default = "default_copy_quarantine")]
+    copy_quarantine: bool,
+}
+
+fn default_copy_quarantine() -> bool {
+    true
 }
 
 fn default_source() -> String {
@@ -233,6 +245,7 @@ fn validate_profile(name: &str, raw: RawProfile) -> Result<Profile> {
         ignore,
         quarantine,
         delete_source: raw.delete_source,
+        copy_quarantine: raw.copy_quarantine,
     })
 }
 
@@ -402,6 +415,7 @@ profiles:
             ignore: vec!["*.tmp".to_string()],
             quarantine: Some("/tmp/quarantine".to_string()),
             delete_source: true,
+            copy_quarantine: true,
         };
 
         let yaml = serde_yaml_ng::to_string(&original).unwrap();
@@ -425,6 +439,7 @@ profiles:
             ignore: vec!["*.LRV".to_string()],
             quarantine: None,
             delete_source: false,
+            copy_quarantine: false,
         };
 
         let yaml = serde_yaml_ng::to_string(&original).unwrap();
@@ -578,10 +593,56 @@ profiles:
             ignore: vec![],
             quarantine: None,
             delete_source: false,
+            copy_quarantine: true,
         };
 
         let yaml = serde_yaml_ng::to_string(&original).unwrap();
         let round_tripped: RawProfile = serde_yaml_ng::from_str(&yaml).unwrap();
         assert_eq!(original, round_tripped);
+    }
+
+    #[test]
+    fn copy_quarantine_defaults_to_true_when_omitted() {
+        // Spec scenario: "Quarantine copy defaults to enabled" — a
+        // profile that omits `copy_quarantine` must load with the field
+        // set to `true` (i.e. today's verified-copy behavior).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  cam:\n    type: generic\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = load(&path).unwrap();
+        assert!(
+            cfg.profiles.get("cam").unwrap().copy_quarantine,
+            "omitting copy_quarantine should default to true"
+        );
+    }
+
+    #[test]
+    fn copy_quarantine_false_loads_correctly() {
+        // Spec scenario: "Quarantine copy can be disabled" — a profile
+        // with `copy_quarantine: false` must load with the field `false`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  cam:\n    type: generic\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n    copy_quarantine: false\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = load(&path).unwrap();
+        assert!(
+            !cfg.profiles.get("cam").unwrap().copy_quarantine,
+            "copy_quarantine: false must load as false"
+        );
     }
 }

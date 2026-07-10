@@ -38,7 +38,7 @@ profiles:
     type: gopro               # selects the device implementation
     source: auto               # or an explicit path, e.g. /media/alice/GOPRO
     destination: ~/Videos/commute
-    layout: "{date:%Y}/{date:%Y-%m-%d}"
+    layout: "{date:%Y}/{date:%Y-%m-%d}_{date:%H-%M}"
     ignore:
       - "*.THM"
       - "*.LRV"
@@ -68,6 +68,7 @@ Common fields, available to every profile:
 | `ignore`        | Glob patterns for files to skip entirely                         |
 | `quarantine`    | Where footage that doesn't meet the keep criteria goes           |
 | `delete_source` | Delete source files after a verified transfer (per-run: `--keep-source` overrides) |
+| `copy_quarantine` | Copy quarantined footage to the quarantine folder (default `true`). Set to `false` to leave it on the source untouched — it is still reported as `QUARANTINE` in `scan` output, but no copy is made and no quarantine directory is created. A file left in place is never a deletion candidate, so `delete_source` cannot remove it. |
 
 Device-specific fields (only valid on their own `type`; e.g. `require_marker`
 on a non-`gopro` profile, or `events`/`reasons` on a non-`tesla` profile,
@@ -86,6 +87,9 @@ A HERO8 card's `DCIM/1*GOPRO/` chapter files (`GX01nnnn.MP4`, `GX02nnnn.MP4`,
 several chapters. A HiLight marker (the side-button press) anywhere in the
 session keeps the *whole* session; a session with no markers is quarantined,
 not deleted. Set `require_marker: false` to keep every session regardless.
+Set `copy_quarantine: false` to leave unmarked sessions on the card entirely
+— they are still recognized and reported as `QUARANTINE` in `scan` output,
+but no copy is made and no quarantine folder is created.
 Kept sessions get a `markers.json` sidecar recording the camera model,
 session id, and chapter files. HERO8 chapters carry a GPMF telemetry track
 (`gpmd`) with GPS fixes and GPS-derived UTC; when it's present and usable

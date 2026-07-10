@@ -328,3 +328,61 @@ fn ignored_globs_and_unrecognized_files_are_left_alone() {
         "the recognized chapter still imports normally"
     );
 }
+
+// --- 5.3: copy_quarantine: false leaves unmarked session on card, no _quarantine dir ---
+
+#[test]
+fn copy_quarantine_false_leaves_unmarked_on_card_and_keeps_marked() {
+    // Spec 5.3: end-to-end run with copy_quarantine: false.
+    // The unmarked session must remain on the card and no _quarantine
+    // folder is created, while the marked session imports normally.
+    let dir = tempfile::tempdir().unwrap();
+    let card = dir.path().join("card");
+    let creation_time = creation_time_2026_07_09();
+
+    // Marked session (has a HiLight marker).
+    write_chapter(
+        &card.join("DCIM/100GOPRO/GX010123.MP4"),
+        creation_time,
+        &[5000],
+    );
+    // Unmarked session (no markers — will be quarantined).
+    write_chapter(&card.join("DCIM/100GOPRO/GX010124.MP4"), creation_time, &[]);
+
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    gopro_config(&config_path, &dest, "    copy_quarantine: false\n");
+
+    let status = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "import",
+            "gopro",
+            "--source",
+            card.to_str().unwrap(),
+            "--yes",
+        ])
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0));
+
+    // Marked session is imported.
+    assert!(
+        dest.join("2026/2026-07-09/GX010123.MP4").exists(),
+        "marked session should be imported normally"
+    );
+
+    // No _quarantine directory must exist.
+    assert!(
+        !dest.join("_quarantine").exists(),
+        "no _quarantine folder should be created when copy_quarantine is false"
+    );
+
+    // Unmarked session must still be on the card, untouched.
+    assert!(
+        card.join("DCIM/100GOPRO/GX010124.MP4").exists(),
+        "unmarked session must remain on the card when copy_quarantine is false"
+    );
+}

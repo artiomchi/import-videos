@@ -13,6 +13,12 @@ use crate::source::{ImportSource, MediaGroup, Verdict};
 /// destination (`Keep`) or quarantine (`Quarantine`) directory. Every
 /// decision `import` will make is visible here, verbatim, before any
 /// file moves (spec: "Import executes exactly the scanned plan").
+///
+/// A `Quarantine` action with `quarantine_path == None` means "report
+/// the verdict, but leave the source untouched" — produced when the
+/// profile sets `copy_quarantine: false`. Because no files are
+/// transferred for such a group, it can never become a source-deletion
+/// candidate.
 #[derive(Debug, Clone)]
 pub struct PlannedAction {
     pub group: MediaGroup,
@@ -92,11 +98,17 @@ pub fn build_plan(
                 (Some(profile.destination.join(relative)), None)
             }
             Verdict::Quarantine => {
-                let base = profile
-                    .quarantine
-                    .clone()
-                    .unwrap_or_else(|| profile.destination.join("_quarantine"));
-                (None, Some(base.join(&group.name)))
+                if profile.copy_quarantine {
+                    let base = profile
+                        .quarantine
+                        .clone()
+                        .unwrap_or_else(|| profile.destination.join("_quarantine"));
+                    (None, Some(base.join(&group.name)))
+                } else {
+                    // copy_quarantine: false — leave source in place;
+                    // no path to transfer to.
+                    (None, None)
+                }
             }
             Verdict::Ignore(_) => (None, None),
         };
@@ -109,4 +121,98 @@ pub fn build_plan(
     }
 
     Ok(ImportPlan { actions })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{LayoutTemplate, SourceKind};
+    use crate::error;
+    use crate::source::MediaGroup;
+    use globset::GlobSetBuilder;
+    use std::collections::HashMap;
+
+    fn empty_globset() -> globset::GlobSet {
+        GlobSetBuilder::new().build().unwrap()
+    }
+
+    fn profile_with_copy_quarantine(dest: PathBuf, copy_quarantine: bool) -> Profile {
+        Profile {
+            kind: SourceKind::Generic,
+            source: SourceLocation::Auto,
+            destination: dest,
+            layout: LayoutTemplate::parse("{date:%Y}/{date:%Y-%m-%d}").unwrap(),
+            ignore: empty_globset(),
+            quarantine: None,
+            delete_source: false,
+            copy_quarantine,
+        }
+    }
+
+    struct StubSource {
+        groups: Vec<(MediaGroup, Verdict)>,
+    }
+
+    impl ImportSource for StubSource {
+        fn detect(&self, _root: &Path) -> bool {
+            true
+        }
+        fn scan(
+            &self,
+            _root: &Path,
+            _ignore: &globset::GlobSet,
+        ) -> error::Result<Vec<(MediaGroup, Verdict)>> {
+            Ok(self.groups.clone())
+        }
+    }
+
+    fn quarantine_group() -> MediaGroup {
+        MediaGroup {
+            name: "unmarked".to_string(),
+            files: vec![],
+            timestamp: jiff::Timestamp::from_second(0).unwrap(),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        }
+    }
+
+    #[test]
+    fn quarantine_group_resolves_path_when_copy_quarantine_enabled() {
+        let dest = PathBuf::from("/dest");
+        let prof = profile_with_copy_quarantine(dest.clone(), true);
+        let source = StubSource {
+            groups: vec![(quarantine_group(), Verdict::Quarantine)],
+        };
+        let plan = build_plan(&prof, &source, Path::new("/src")).unwrap();
+        let action = &plan.actions[0];
+        assert!(
+            action.quarantine_path.is_some(),
+            "copy_quarantine: true should resolve a quarantine path"
+        );
+        assert_eq!(
+            action.quarantine_path,
+            Some(dest.join("_quarantine").join("unmarked"))
+        );
+    }
+
+    #[test]
+    fn quarantine_group_has_no_path_when_copy_quarantine_disabled() {
+        let prof = profile_with_copy_quarantine(PathBuf::from("/dest"), false);
+        let source = StubSource {
+            groups: vec![(quarantine_group(), Verdict::Quarantine)],
+        };
+        let plan = build_plan(&prof, &source, Path::new("/src")).unwrap();
+        let action = &plan.actions[0];
+        assert_eq!(
+            action.quarantine_path, None,
+            "copy_quarantine: false must resolve quarantine_path to None"
+        );
+        assert_eq!(
+            action.verdict,
+            Verdict::Quarantine,
+            "verdict must still be Quarantine"
+        );
+    }
 }

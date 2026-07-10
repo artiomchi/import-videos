@@ -56,6 +56,11 @@ pub fn render_plan(plan: &ImportPlan, verbose: bool) -> String {
         let _ = write!(out, "[{verdict}] {} — {reason}", action.group.name);
         if let Some(path) = path {
             let _ = write!(out, " -> {}", path.display());
+        } else if matches!(action.verdict, Verdict::Quarantine) {
+            // quarantine_path is None only when copy_quarantine: false;
+            // make this visible so the user knows the footage was
+            // recognized but deliberately left on the source.
+            let _ = write!(out, " (quarantine copy disabled, left on source)");
         }
         let _ = writeln!(out);
 
@@ -121,6 +126,10 @@ pub fn render_results(report: &ExecuteReport) -> String {
                 TransferOutcome::Suffixed(dest) => format!(
                     "stored as {} (destination name collision): {}",
                     dest.display(),
+                    file.src.display()
+                ),
+                TransferOutcome::SkippedQuarantineDisabled => format!(
+                    "left on source (quarantine copy disabled): {}",
                     file.src.display()
                 ),
                 TransferOutcome::Failed(message) => {
@@ -254,5 +263,57 @@ mod tests {
         let out = render_plan(&plan, true);
 
         assert!(out.contains("recorded at: 1970-01-01T00:00:00Z (source: gps)"));
+    }
+
+    #[test]
+    fn verbose_quarantine_with_disabled_copy_shows_note_not_path() {
+        // Task 4.3: a Quarantine group with quarantine_path == None
+        // (copy_quarantine: false) must render the disabled note in
+        // both verbose and non-verbose modes.
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group: group("unmarked", vec![]),
+                verdict: Verdict::Quarantine,
+                destination: None,
+                quarantine_path: None, // copy_quarantine: false
+            }],
+        };
+
+        let out_verbose = render_plan(&plan, true);
+        assert!(
+            out_verbose.contains("[QUARANTINE] unmarked"),
+            "verbose must show the quarantine entry"
+        );
+        assert!(
+            out_verbose.contains("quarantine copy disabled"),
+            "verbose must show disabled note"
+        );
+        assert!(
+            !out_verbose.contains("->"),
+            "must not show a path when copy is disabled"
+        );
+        assert!(out_verbose.contains("Summary: 0 kept, 1 quarantined, 0 ignored (1 total)"));
+    }
+
+    #[test]
+    fn results_render_left_on_source_outcome() {
+        // Task 4.3: SkippedQuarantineDisabled renders a clear message.
+        use crate::transfer::{ExecuteReport, FileResult, GroupResult};
+        let report = ExecuteReport {
+            groups: vec![GroupResult {
+                group_name: "unmarked".to_string(),
+                verdict: Verdict::Quarantine,
+                files: vec![FileResult {
+                    src: PathBuf::from("/card/clip.mp4"),
+                    outcome: TransferOutcome::SkippedQuarantineDisabled,
+                }],
+                sidecar_outcome: None,
+                deleted_from_source: false,
+            }],
+            deletion_skipped_reason: None,
+        };
+
+        let out = render_results(&report);
+        assert!(out.contains("left on source (quarantine copy disabled): /card/clip.mp4"));
     }
 }

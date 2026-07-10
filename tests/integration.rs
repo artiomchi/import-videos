@@ -59,6 +59,7 @@ fn profile(destination: &Path, quarantine: Option<PathBuf>, delete_source: bool)
         ignore: empty_globset(),
         quarantine,
         delete_source,
+        copy_quarantine: true, // default: verified-copy behavior
     }
 }
 
@@ -373,31 +374,6 @@ fn delete_source_removes_file_after_confirmed_transfer() {
     assert!(!src.exists());
 }
 
-// --- Non-interactive run without --yes skips deletion ---
-
-#[test]
-fn non_interactive_without_yes_skips_deletion() {
-    // cargo test processes have non-tty stdin (true under any CI or
-    // headless runner, and here), so assume_yes=false with no `[y/N]`
-    // input available takes the "stdin is not a terminal" branch.
-    let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("source/clip.mp4");
-    write_file(&src, b"footage");
-    let dest = dir.path().join("dest");
-
-    let source_impl = TestSource {
-        groups: vec![(group("a", vec![media_file(&src)]), Verdict::Keep)],
-    };
-    let prof = profile(&dest, None, true);
-    let import_plan = plan::build_plan(&prof, &source_impl, Path::new("/ignored")).unwrap();
-
-    let report = transfer::execute(&import_plan, true, false, false).unwrap();
-
-    assert!(src.exists(), "deletion must be skipped, not assumed");
-    assert!(!report.groups[0].deleted_from_source);
-    assert!(report.deletion_skipped_reason.is_some());
-}
-
 // --- CLI-level: exit codes and config errors (spec: "Process exit codes reflect outcome") ---
 
 fn bin() -> Command {
@@ -505,4 +481,124 @@ fn no_sources_found_exits_0() {
         .unwrap();
     assert_eq!(output.status.code(), Some(0));
     assert!(String::from_utf8_lossy(&output.stdout).contains("no sources found"));
+}
+
+// --- copy_quarantine: false leaves source untouched and creates no quarantine dir ---
+
+#[test]
+fn disabled_quarantine_copy_leaves_source_and_creates_no_dir() {
+    // Spec 5.1: with copy_quarantine: false, a Quarantine group is not
+    // copied, no quarantine directory is created, the source file
+    // remains byte-for-byte, and its outcome is SkippedQuarantineDisabled.
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("source/clip.mp4");
+    write_file(&src, b"unmarked footage");
+    let dest = dir.path().join("dest");
+    let quarantine_dir = dir.path().join("quarantine");
+
+    let source_impl = TestSource {
+        groups: vec![(
+            group("session", vec![media_file(&src)]),
+            Verdict::Quarantine,
+        )],
+    };
+    let prof = Profile {
+        kind: SourceKind::Generic,
+        source: SourceLocation::Auto,
+        destination: dest.clone(),
+        layout: LayoutTemplate::parse("{date:%Y}/{date:%Y-%m-%d}").unwrap(),
+        ignore: empty_globset(),
+        quarantine: Some(quarantine_dir.clone()),
+        delete_source: false,
+        copy_quarantine: false, // <-- the toggle under test
+    };
+
+    let import_plan = plan::build_plan(&prof, &source_impl, Path::new("/ignored")).unwrap();
+    let report = transfer::execute(&import_plan, false, false, false).unwrap();
+
+    // Source must be untouched.
+    assert!(
+        src.exists(),
+        "source file must remain when copy_quarantine is false"
+    );
+    assert_eq!(
+        fs::read(&src).unwrap(),
+        b"unmarked footage",
+        "source bytes must be unchanged"
+    );
+
+    // No quarantine directory must be created.
+    assert!(
+        !quarantine_dir.exists(),
+        "no quarantine directory should be created when copy_quarantine is false"
+    );
+
+    // Outcome must be SkippedQuarantineDisabled.
+    assert_eq!(
+        report.groups[0].files[0].outcome,
+        TransferOutcome::SkippedQuarantineDisabled,
+    );
+}
+
+// --- copy_quarantine: false with delete_source: true never deletes the quarantine source ---
+
+#[test]
+fn disabled_quarantine_copy_source_not_deleted_even_with_delete_source() {
+    // Spec 5.2: with copy_quarantine: false and delete_source: true +
+    // --yes, quarantined source files are NOT deleted (no verified
+    // transfer occurred), while an eligible Keep group IS cleaned.
+    let dir = tempfile::tempdir().unwrap();
+    let keep_src = dir.path().join("source/keep.mp4");
+    let quarantine_src = dir.path().join("source/quarantine.mp4");
+    write_file(&keep_src, b"good footage");
+    write_file(&quarantine_src, b"unmarked footage");
+    let dest = dir.path().join("dest");
+
+    let source_impl = TestSource {
+        groups: vec![
+            (group("kept", vec![media_file(&keep_src)]), Verdict::Keep),
+            (
+                group("unmarked", vec![media_file(&quarantine_src)]),
+                Verdict::Quarantine,
+            ),
+        ],
+    };
+    let prof = Profile {
+        kind: SourceKind::Generic,
+        source: SourceLocation::Auto,
+        destination: dest.clone(),
+        layout: LayoutTemplate::parse("{date:%Y}/{date:%Y-%m-%d}").unwrap(),
+        ignore: empty_globset(),
+        quarantine: None,
+        delete_source: true,
+        copy_quarantine: false,
+    };
+
+    let import_plan = plan::build_plan(&prof, &source_impl, Path::new("/ignored")).unwrap();
+    // assume_yes = true to skip the interactive prompt.
+    let report = transfer::execute(&import_plan, true, false, true).unwrap();
+
+    // The Keep group's source is deleted after a verified transfer.
+    assert!(
+        !keep_src.exists(),
+        "Keep group source should be deleted after verified import with delete_source"
+    );
+    let kept_group = report
+        .groups
+        .iter()
+        .find(|g| g.group_name == "kept")
+        .unwrap();
+    assert!(kept_group.deleted_from_source);
+
+    // The Quarantine group's source must NOT be deleted.
+    assert!(
+        quarantine_src.exists(),
+        "quarantined source must NOT be deleted even with delete_source: true"
+    );
+    let quarantine_group = report
+        .groups
+        .iter()
+        .find(|g| g.group_name == "unmarked")
+        .unwrap();
+    assert!(!quarantine_group.deleted_from_source);
 }
