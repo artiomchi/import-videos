@@ -10,6 +10,7 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
+use indicatif::{ProgressBar, ProgressStyle};
 use jiff::Timestamp;
 
 use crate::error::{Error, Result};
@@ -17,6 +18,61 @@ use crate::plan::ImportPlan;
 use crate::source::{Sidecar, Verdict};
 
 const BUF_SIZE: usize = 64 * 1024;
+
+/// Byte-level transfer progress (design D6): a thin wrapper around an
+/// `Option<ProgressBar>` so every call site can tick unconditionally —
+/// `hidden()` (piped stdout, `--json`, or tests) makes every method a
+/// no-op, with nothing constructed or drawn.
+pub struct Progress {
+    bar: Option<ProgressBar>,
+}
+
+impl Progress {
+    /// `enabled` should be `stdout is a TTY && !--json` — decided once
+    /// by the CLI layer, never re-checked here (design D6).
+    pub fn new(enabled: bool) -> Self {
+        if !enabled {
+            return Progress { bar: None };
+        }
+        let bar = ProgressBar::new(0);
+        bar.set_style(
+            ProgressStyle::with_template(
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}",
+            )
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("#>-"),
+        );
+        Progress { bar: Some(bar) }
+    }
+
+    pub fn hidden() -> Self {
+        Progress { bar: None }
+    }
+
+    fn set_length(&self, len: u64) {
+        if let Some(bar) = &self.bar {
+            bar.set_length(len);
+        }
+    }
+
+    fn set_message(&self, msg: String) {
+        if let Some(bar) = &self.bar {
+            bar.set_message(msg);
+        }
+    }
+
+    fn inc(&self, delta: u64) {
+        if let Some(bar) = &self.bar {
+            bar.inc(delta);
+        }
+    }
+
+    fn finish(&self) {
+        if let Some(bar) = &self.bar {
+            bar.finish_and_clear();
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferOutcome {
@@ -109,6 +165,7 @@ pub fn execute(
     keep_source: bool,
     assume_yes: bool,
     quick_match: bool,
+    progress: &Progress,
 ) -> Result<ExecuteReport> {
     // The one place we consult the ambient terminal: whether stdin is
     // interactive is what decides if a missing `--yes` prompts or
@@ -123,6 +180,7 @@ pub fn execute(
         assume_yes,
         quick_match,
         io::stdin().is_terminal(),
+        progress,
     )
 }
 
@@ -133,7 +191,20 @@ fn execute_inner(
     assume_yes: bool,
     quick_match: bool,
     stdin_is_terminal: bool,
+    progress: &Progress,
 ) -> Result<ExecuteReport> {
+    let total_bytes: u64 = plan
+        .actions
+        .iter()
+        .filter(|a| {
+            matches!(a.verdict, Verdict::Keep)
+                || (matches!(a.verdict, Verdict::Quarantine) && a.quarantine_path.is_some())
+        })
+        .flat_map(|a| &a.group.files)
+        .map(|f| f.size)
+        .sum();
+    progress.set_length(total_bytes);
+
     let mut groups = Vec::with_capacity(plan.actions.len());
 
     for action in &plan.actions {
@@ -146,8 +217,16 @@ fn execute_inner(
         let mut files = Vec::with_capacity(action.group.files.len());
         if let Some(dir) = target_dir {
             for media_file in &action.group.files {
-                let outcome =
-                    transfer_file(&media_file.path, dir, media_file.recorded_at, quick_match)?;
+                if let Some(name) = media_file.path.file_name() {
+                    progress.set_message(name.to_string_lossy().into_owned());
+                }
+                let outcome = transfer_file(
+                    &media_file.path,
+                    dir,
+                    media_file.recorded_at,
+                    quick_match,
+                    progress,
+                )?;
                 files.push(FileResult {
                     src: media_file.path.clone(),
                     outcome,
@@ -192,7 +271,11 @@ fn execute_inner(
         });
 
         if any_eligible {
-            match confirm_deletion(assume_yes, stdin_is_terminal)? {
+            match confirm(
+                "Delete source files now that they are safely imported? [y/N]",
+                assume_yes,
+                stdin_is_terminal,
+            )? {
                 Confirmation::Confirmed => {
                     for group in &mut groups {
                         let all_ok = !group.files.is_empty()
@@ -220,13 +303,15 @@ fn execute_inner(
         }
     }
 
+    progress.finish();
+
     Ok(ExecuteReport {
         groups,
         deletion_skipped_reason,
     })
 }
 
-enum Confirmation {
+pub enum Confirmation {
     Confirmed,
     DeclinedInteractive,
     SkippedNonInteractive,
@@ -235,14 +320,16 @@ enum Confirmation {
 /// Destructive steps prompt on stdin unless `--yes` is passed;
 /// non-interactive stdin without `--yes` aborts rather than assumes
 /// (design D8, spec: "Destructive steps require confirmation").
-fn confirm_deletion(assume_yes: bool, stdin_is_terminal: bool) -> Result<Confirmation> {
+/// Shared by `import`'s source deletion and `cleanup`'s purge (design
+/// D7) so the two never drift on confirmation semantics.
+pub fn confirm(prompt: &str, assume_yes: bool, stdin_is_terminal: bool) -> Result<Confirmation> {
     if assume_yes {
         return Ok(Confirmation::Confirmed);
     }
     if !stdin_is_terminal {
         return Ok(Confirmation::SkippedNonInteractive);
     }
-    print!("Delete source files now that they are safely imported? [y/N] ");
+    print!("{prompt} ");
     io::stdout()
         .flush()
         .map_err(|e| Error::io(Path::new("<stdout>"), e))?;
@@ -255,7 +342,7 @@ fn confirm_deletion(assume_yes: bool, stdin_is_terminal: bool) -> Result<Confirm
 
 /// Interprets a y/N answer: only `y`/`yes` (case- and whitespace-
 /// insensitive) confirm; anything else — including an empty line —
-/// declines. Split out from `confirm_deletion` so the accept/decline
+/// declines. Split out from `confirm` so the accept/decline
 /// decision is unit-testable without a real terminal on stdin.
 fn parse_confirmation(line: &str) -> Confirmation {
     match line.trim().to_lowercase().as_str() {
@@ -302,10 +389,11 @@ pub fn transfer_file(
     dest_dir: &Path,
     recorded_at: Option<Timestamp>,
     quick_match: bool,
+    progress: &Progress,
 ) -> Result<TransferOutcome> {
     fs::create_dir_all(dest_dir).map_err(|e| Error::io(dest_dir, e))?;
 
-    match transfer_inner(src, dest_dir, recorded_at, quick_match) {
+    match transfer_inner(src, dest_dir, recorded_at, quick_match, progress) {
         Ok(outcome) => Ok(outcome),
         Err(e) => Ok(TransferOutcome::Failed(e.to_string())),
     }
@@ -316,6 +404,7 @@ fn transfer_inner(
     dest_dir: &Path,
     recorded_at: Option<Timestamp>,
     quick_match: bool,
+    progress: &Progress,
 ) -> Result<TransferOutcome> {
     let file_name = src.file_name().ok_or_else(|| {
         Error::io(
@@ -359,7 +448,7 @@ fn transfer_inner(
         PathBuf::from(name)
     };
 
-    let dest_hash = match copy_and_hash(src, &part_path) {
+    let dest_hash = match copy_and_hash(src, &part_path, progress) {
         Ok(hash) => hash,
         Err(e) => {
             let _ = fs::remove_file(&part_path);
@@ -458,7 +547,7 @@ fn suffixed_path(dest_dir: &Path, file_name: &OsStr, n: u32) -> PathBuf {
     dest_dir.join(new_name)
 }
 
-fn copy_and_hash(src: &Path, dest: &Path) -> Result<blake3::Hash> {
+fn copy_and_hash(src: &Path, dest: &Path, progress: &Progress) -> Result<blake3::Hash> {
     let mut reader = File::open(src).map_err(|e| Error::io(src, e))?;
     let mut writer = File::create(dest).map_err(|e| Error::io(dest, e))?;
     let mut hasher = blake3::Hasher::new();
@@ -472,6 +561,7 @@ fn copy_and_hash(src: &Path, dest: &Path) -> Result<blake3::Hash> {
         writer
             .write_all(&buf[..n])
             .map_err(|e| Error::io(dest, e))?;
+        progress.inc(n as u64);
     }
     writer.flush().map_err(|e| Error::io(dest, e))?;
     Ok(hasher.finalize())
@@ -576,7 +666,8 @@ mod tests {
             }],
         };
 
-        let report = execute_inner(&plan, true, false, false, false, false).unwrap();
+        let report =
+            execute_inner(&plan, true, false, false, false, false, &Progress::hidden()).unwrap();
 
         assert!(src.exists(), "deletion must be skipped, not assumed");
         assert!(!report.groups[0].deleted_from_source);
@@ -590,7 +681,7 @@ mod tests {
         fs::write(&src, b"hello").unwrap();
         let dest_dir = dir.path().join("dest");
 
-        let outcome = transfer_file(&src, &dest_dir, None, false).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, None, false, &Progress::hidden()).unwrap();
         assert_eq!(outcome, TransferOutcome::Transferred);
         assert_eq!(fs::read(dest_dir.join("clip.mp4")).unwrap(), b"hello");
         assert!(src.exists(), "transfer never deletes the source");
@@ -606,7 +697,7 @@ mod tests {
         fs::create_dir_all(&dest_dir).unwrap();
         fs::write(dest_dir.join("clip.mp4"), b"hello").unwrap();
 
-        let outcome = transfer_file(&src, &dest_dir, None, false).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, None, false, &Progress::hidden()).unwrap();
         assert_eq!(outcome, TransferOutcome::SkippedIdentical);
     }
 
@@ -620,7 +711,14 @@ mod tests {
         let dest_dir = dir.path().join("dest");
 
         let recorded_at: Timestamp = "2026-07-09T07:41:03Z".parse().unwrap();
-        let outcome = transfer_file(&src, &dest_dir, Some(recorded_at), false).unwrap();
+        let outcome = transfer_file(
+            &src,
+            &dest_dir,
+            Some(recorded_at),
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
         assert_eq!(outcome, TransferOutcome::Transferred);
 
         let dest_path = dest_dir.join("clip.mp4");
@@ -666,7 +764,7 @@ mod tests {
             }],
         };
 
-        execute(&plan, false, false, false, false).unwrap();
+        execute(&plan, false, false, false, false, &Progress::hidden()).unwrap();
 
         let mtime = fs::metadata(quarantine_dir.join("clip.mp4"))
             .unwrap()
@@ -697,7 +795,14 @@ mod tests {
             .unwrap();
 
         let recorded_at: Timestamp = "2026-07-09T07:41:03Z".parse().unwrap();
-        let outcome = transfer_file(&src, &dest_dir, Some(recorded_at), false).unwrap();
+        let outcome = transfer_file(
+            &src,
+            &dest_dir,
+            Some(recorded_at),
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
         assert_eq!(outcome, TransferOutcome::SkippedIdentical);
 
         let mtime_after = fs::metadata(&dest_path).unwrap().modified().unwrap();
@@ -714,7 +819,7 @@ mod tests {
         fs::write(&src, b"hello").unwrap();
         let dest_dir = dir.path().join("dest");
 
-        let outcome = transfer_file(&src, &dest_dir, None, false).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, None, false, &Progress::hidden()).unwrap();
         assert_eq!(outcome, TransferOutcome::Transferred);
         // No panic and a normal outcome is the whole point here: with
         // `recorded_at: None`, `transfer_inner` never calls
@@ -752,7 +857,7 @@ mod tests {
             }],
         };
 
-        let report = execute(&plan, false, false, false, false).unwrap();
+        let report = execute(&plan, false, false, false, false, &Progress::hidden()).unwrap();
 
         assert!(matches!(
             report.groups[0].sidecar_outcome,
@@ -785,7 +890,7 @@ mod tests {
             }],
         };
 
-        let report = execute(&plan, true, false, true, false).unwrap();
+        let report = execute(&plan, true, false, true, false, &Progress::hidden()).unwrap();
 
         assert!(matches!(
             report.groups[0].sidecar_outcome,
@@ -807,12 +912,71 @@ mod tests {
         fs::create_dir_all(&dest_dir).unwrap();
         fs::write(dest_dir.join("clip.mp4"), b"old-bytes").unwrap();
 
-        let outcome = transfer_file(&src, &dest_dir, None, false).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, None, false, &Progress::hidden()).unwrap();
         let TransferOutcome::Suffixed(path) = outcome else {
             panic!("expected Suffixed, got different outcome");
         };
         assert_eq!(path, dest_dir.join("clip-1.mp4"));
         assert_eq!(fs::read(&path).unwrap(), b"new-bytes");
         assert_eq!(fs::read(dest_dir.join("clip.mp4")).unwrap(), b"old-bytes");
+    }
+
+    // --- progress (design D6, task 5.4) ---
+
+    #[test]
+    fn hidden_progress_never_constructs_a_bar() {
+        // Task 5.4: piped/JSON output must carry no progress or
+        // terminal-control bytes. `Progress::hidden()` never allocates
+        // an indicatif `ProgressBar`, so every method is an inert no-op
+        // by construction — this exercises the full call surface
+        // (set_length/set_message/inc/finish, via a real transfer) to
+        // pin that none of it panics or depends on a live bar.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello world").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let group = MediaGroup {
+            name: "a".to_string(),
+            files: vec![MediaFile {
+                path: src.clone(),
+                size: 11,
+                recorded_at: None,
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group,
+                verdict: Verdict::Keep,
+                destination: Some(dest_dir.clone()),
+                quarantine_path: None,
+            }],
+        };
+
+        let report = execute(&plan, false, false, false, false, &Progress::hidden()).unwrap();
+        assert!(matches!(
+            report.groups[0].files[0].outcome,
+            TransferOutcome::Transferred
+        ));
+    }
+
+    #[test]
+    fn visible_progress_bar_can_be_constructed_and_used() {
+        // Confirms `Progress::new(true)` builds a real bar without
+        // panicking on the template string, and that ticking it
+        // through a real transfer doesn't error.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello world").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let progress = Progress::new(true);
+        let outcome = transfer_file(&src, &dest_dir, None, false, &progress).unwrap();
+        assert_eq!(outcome, TransferOutcome::Transferred);
     }
 }

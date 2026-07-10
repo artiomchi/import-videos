@@ -18,3 +18,4 @@ Keep notes under a page. Link related ADRs.
 - [Binary parsing with std](binary-parsing-with-std.md) — reading MP4 boxes with `Read`/`Seek`, no parser crate
 - [Iterators and lifetimes in stream parsing](iterators-lifetimes-in-stream-parsing.md) — `KlvIter<'a>`'s borrowed items vs. `mp4.rs`'s owned, `Read`-based walker
 - [Making illegal states unrepresentable with enums](illegal-states-with-enums.md) — Tesla's `Reasons` allow-xor-deny enum vs. two `Option` fields, and its `#[serde(flatten)]` round-trip limit
+- [Serde view-models vs. deriving on domain types](serde-view-models-vs-domain-types.md) — `report.rs`'s `PlanJson`/`ResultsJson`, and why the JSON contract isn't derived onto `ImportPlan`/`ExecuteReport` directly

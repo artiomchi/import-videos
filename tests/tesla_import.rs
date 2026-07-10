@@ -469,3 +469,93 @@ fn clip_mtimes_match_their_own_stems() {
         "clip mtime should match its own filename stem, resolved in UTC"
     );
 }
+
+// --- --json output (add-maintenance-commands, task 2.4) ---
+
+#[test]
+fn import_json_yes_emits_one_document_with_per_file_outcomes() {
+    let dir = tempfile::tempdir().unwrap();
+    let card = dir.path().join("card");
+    let event_dir = card.join("TeslaCam/SavedClips/2026-07-04_18-23-51");
+    write(
+        &event_dir.join("event.json"),
+        &event_json("2026-07-04T18:23:51", "user_interaction_honk"),
+    );
+    write(&event_dir.join("2026-07-04_18-18-32-front.mp4"), "front");
+
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    tesla_config(&config_path, &dest, "    delete_source: true\n");
+
+    let output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "import",
+            "tesla",
+            "--source",
+            card.to_str().unwrap(),
+            "--yes",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+
+    // Exactly one JSON document on stdout: parsing the whole of stdout
+    // as a single value fails if there's any extra text before/after it.
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        panic!("stdout was not a single JSON document: {e}\nstdout was:\n{stdout}")
+    });
+
+    assert_eq!(value["summary"]["transferred"], 2); // event.json + the clip
+    let group = &value["groups"][0];
+    assert_eq!(group["group"], "saved-2026-07-04_18-23-51");
+    assert_eq!(group["deleted_from_source"], true);
+    assert!(
+        group["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["outcome"] == "transferred")
+    );
+
+    // Confirmation rules are unchanged under --json: --yes was required
+    // and honored, matching non-JSON `import --yes` behavior.
+    assert!(
+        !event_dir.join("event.json").exists(),
+        "source must be deleted after --yes"
+    );
+}
+
+#[test]
+fn scan_json_no_sources_is_a_json_document_not_a_bare_string() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("empty-card");
+    fs::create_dir_all(&source_dir).unwrap();
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    tesla_config(&config_path, &dest, "");
+
+    let output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "scan",
+            "tesla",
+            "--source",
+            source_dir.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(value["status"], "no_sources");
+    assert_eq!(value["profile"], "tesla");
+}

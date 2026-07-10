@@ -101,6 +101,18 @@ pub struct Profile {
     pub copy_quarantine: bool,
 }
 
+impl Profile {
+    /// Resolves this profile's quarantine root: the explicit
+    /// `quarantine` path, or `{destination}/_quarantine` when unset.
+    /// Shared by planning (`plan::build_plan`) and `cleanup`, so the two
+    /// can never resolve a different directory (design D1).
+    pub fn quarantine_root(&self) -> PathBuf {
+        self.quarantine
+            .clone()
+            .unwrap_or_else(|| self.destination.join("_quarantine"))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub profiles: HashMap<String, Profile>,

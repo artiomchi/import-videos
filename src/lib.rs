@@ -2,15 +2,18 @@
 //! independent of the CLI binary (ADR 0005). `main.rs` is a one-liner
 //! that calls `run()` and exits with its code.
 
+pub mod cleanup;
 pub mod cli;
 pub mod config;
 pub mod error;
+pub mod inspect;
 pub mod media;
 pub mod plan;
 pub mod report;
 pub mod source;
 pub mod transfer;
 
+use std::io::IsTerminal;
 use std::path::Path;
 
 use clap::Parser;
@@ -35,17 +38,18 @@ pub fn run() -> i32 {
     }
 }
 
+/// Dispatches to each subcommand, loading the config only where it's
+/// actually needed (design D5) — `inspect` operates on a bare path and
+/// must work with no config file present at all.
 fn run_inner(cli: Cli) -> Result<ExitCode> {
-    let config_path = match cli.config {
-        Some(path) => path,
-        None => config::default_config_path()
-            .ok_or_else(|| Error::Config("could not determine the default config path".into()))?,
-    };
-    let cfg = config::load(&config_path)?;
     let verbose = cli.verbose > 0;
+    let json = cli.json;
 
     match cli.command {
-        Command::Scan { profile, source } => run_scan(&cfg, &profile, source.as_deref(), verbose),
+        Command::Scan { profile, source } => {
+            let cfg = load_config(cli.config.as_deref())?;
+            run_scan(&cfg, &profile, source.as_deref(), verbose, json)
+        }
         Command::Import {
             profile,
             source,
@@ -53,17 +57,40 @@ fn run_inner(cli: Cli) -> Result<ExitCode> {
             keep_source,
             yes,
             quick_match,
-        } => run_import(
-            &cfg,
-            &profile,
-            source.as_deref(),
+        } => {
+            let cfg = load_config(cli.config.as_deref())?;
+            run_import(
+                &cfg,
+                &profile,
+                source.as_deref(),
+                dry_run,
+                keep_source,
+                yes,
+                quick_match,
+                verbose,
+                json,
+            )
+        }
+        Command::Cleanup {
+            profile,
+            older_than,
             dry_run,
-            keep_source,
             yes,
-            quick_match,
-            verbose,
-        ),
+        } => {
+            let cfg = load_config(cli.config.as_deref())?;
+            run_cleanup(&cfg, &profile, older_than.as_deref(), dry_run, yes, json)
+        }
+        Command::Inspect { path } => run_inspect(&path, json),
     }
+}
+
+fn load_config(config_path: Option<&Path>) -> Result<config::Config> {
+    let path = match config_path {
+        Some(path) => path.to_path_buf(),
+        None => config::default_config_path()
+            .ok_or_else(|| Error::Config("could not determine the default config path".into()))?,
+    };
+    config::load(&path)
 }
 
 fn get_profile<'a>(cfg: &'a config::Config, name: &str) -> Result<&'a config::Profile> {
@@ -101,20 +128,45 @@ fn scan_profile(
     Ok(Some(import_plan))
 }
 
+/// Prints "no sources found" as a bare string, or — under `--json` — as
+/// a JSON document (design D4: "not a bare human string"), so scripted
+/// callers never have to special-case this outcome.
+fn print_no_sources(profile_name: &str, json: bool) {
+    if json {
+        print_json(&serde_json::json!({
+            "status": "no_sources",
+            "profile": profile_name,
+        }));
+    } else {
+        println!("no sources found for profile '{profile_name}'");
+    }
+}
+
+fn print_json(value: &impl serde::Serialize) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).expect("view-model types always serialize")
+    );
+}
+
+fn print_plan(plan: &plan::ImportPlan, verbose: bool, tz: &jiff::tz::TimeZone, json: bool) {
+    if json {
+        print_json(&report::plan_to_json(plan, tz));
+    } else {
+        print!("{}", report::render_plan(plan, verbose, tz));
+    }
+}
+
 fn run_scan(
     cfg: &config::Config,
     profile_name: &str,
     source_override: Option<&Path>,
     verbose: bool,
+    json: bool,
 ) -> Result<ExitCode> {
     match scan_profile(cfg, profile_name, source_override)? {
-        None => {
-            println!("no sources found for profile '{profile_name}'");
-        }
-        Some(import_plan) => print!(
-            "{}",
-            report::render_plan(&import_plan, verbose, &cfg.timezone)
-        ),
+        None => print_no_sources(profile_name, json),
+        Some(import_plan) => print_plan(&import_plan, verbose, &cfg.timezone, json),
     }
     Ok(ExitCode::Success)
 }
@@ -129,21 +181,24 @@ fn run_import(
     assume_yes: bool,
     quick_match: bool,
     verbose: bool,
+    json: bool,
 ) -> Result<ExitCode> {
     let profile = get_profile(cfg, profile_name)?;
 
     let Some(import_plan) = scan_profile(cfg, profile_name, source_override)? else {
-        println!("no sources found for profile '{profile_name}'");
+        print_no_sources(profile_name, json);
         return Ok(ExitCode::Success);
     };
 
     if dry_run {
-        print!(
-            "{}",
-            report::render_plan(&import_plan, verbose, &cfg.timezone)
-        );
+        print_plan(&import_plan, verbose, &cfg.timezone, json);
         return Ok(ExitCode::Success);
     }
+
+    // Progress bars are visible only on an interactive terminal with
+    // JSON output off (design D6) — never interleaved with piped or
+    // machine-readable output.
+    let progress = transfer::Progress::new(std::io::stdout().is_terminal() && !json);
 
     let exec_report = transfer::execute(
         &import_plan,
@@ -151,8 +206,14 @@ fn run_import(
         keep_source_flag,
         assume_yes,
         quick_match,
+        &progress,
     )?;
-    print!("{}", report::render_results(&exec_report));
+
+    if json {
+        print_json(&report::results_to_json(&exec_report));
+    } else {
+        print!("{}", report::render_results(&exec_report));
+    }
 
     let any_failed = exec_report.groups.iter().any(|g| {
         g.files
@@ -169,4 +230,90 @@ fn run_import(
     } else {
         ExitCode::Success
     })
+}
+
+fn parse_older_than(raw: &str) -> Result<jiff::Span> {
+    raw.parse::<jiff::Span>()
+        .map_err(|e| Error::Config(format!("--older-than: invalid span '{raw}': {e}")))
+}
+
+fn print_cleanup_plan(plan: &cleanup::CleanupPlan, json: bool) {
+    if json {
+        print_json(&report::cleanup_plan_to_json(plan));
+    } else {
+        print!("{}", report::render_cleanup_plan(plan));
+    }
+}
+
+fn run_cleanup(
+    cfg: &config::Config,
+    profile_name: &str,
+    older_than: Option<&str>,
+    dry_run: bool,
+    assume_yes: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let profile = get_profile(cfg, profile_name)?;
+    let older_than = older_than.map(parse_older_than).transpose()?;
+
+    let plan = cleanup::build_plan(profile, older_than, &cfg.timezone, jiff::Timestamp::now())?;
+
+    if plan.entries.is_empty() || dry_run {
+        print_cleanup_plan(&plan, json);
+        return Ok(ExitCode::Success);
+    }
+
+    if !json {
+        print!("{}", report::render_cleanup_plan(&plan));
+    }
+
+    let exec_report = cleanup::execute(&plan, assume_yes)?;
+
+    if json {
+        print_json(&report::cleanup_report_to_json(&exec_report));
+    } else {
+        print!("{}", report::render_cleanup_report(&exec_report));
+    }
+
+    let any_failed = exec_report.results.iter().any(|r| !r.deleted);
+    Ok(if any_failed {
+        ExitCode::Failure
+    } else {
+        ExitCode::Success
+    })
+}
+
+/// `inspect` needs no profile and no config (design D5) — it dispatches
+/// on the path alone, using the system timezone for rendering
+/// (`TimeZone::system()` already falls back to UTC when it can't be
+/// determined).
+fn run_inspect(path: &Path, json: bool) -> Result<ExitCode> {
+    let target = inspect::classify(path).map_err(Error::Config)?;
+    let tz = jiff::tz::TimeZone::system();
+
+    match target {
+        inspect::InspectTarget::Mp4(mp4_path) => {
+            let dump = inspect::inspect_mp4(&mp4_path)?;
+            let has_errors = dump.has_errors();
+            if json {
+                print_json(&report::mp4_dump_to_json(&dump, &tz));
+            } else {
+                print!("{}", report::render_mp4_dump(&dump, &tz));
+            }
+            Ok(if has_errors {
+                ExitCode::Failure
+            } else {
+                ExitCode::Success
+            })
+        }
+        inspect::InspectTarget::TeslaEvent(dir) => {
+            let dump = inspect::inspect_tesla_event(&dir)?;
+            if json {
+                print_json(&report::tesla_dump_to_json(&dump));
+            } else {
+                print!("{}", report::render_tesla_dump(&dump));
+            }
+            Ok(ExitCode::Success)
+        }
+    }
 }

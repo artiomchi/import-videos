@@ -22,6 +22,11 @@ pub struct Cli {
     /// Increase log verbosity (-v info, -vv debug)
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count, global = true)]
     pub verbose: u8,
+
+    /// Emit machine-readable JSON on stdout instead of human-readable
+    /// text; suppresses progress and informational lines (design D4)
+    #[arg(long, global = true)]
+    pub json: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -63,6 +68,32 @@ pub enum Command {
         /// way are never deletion candidates (ADR 0009).
         #[arg(long)]
         quick_match: bool,
+    },
+
+    /// Purge a profile's quarantine directory
+    Cleanup {
+        /// Profile name from the config file
+        profile: String,
+
+        /// Only purge entries that have sat in quarantine longer than
+        /// this (jiff friendly span format, e.g. "30d", "2w")
+        #[arg(long)]
+        older_than: Option<String>,
+
+        /// Print the purge plan and exit without deleting anything
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Assume "yes" at the confirmation prompt
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Dump a single file's device metadata (GoPro MP4 or Tesla event);
+    /// needs no profile or config
+    Inspect {
+        /// A GoPro chapter MP4, a Tesla event folder, or an event.json
+        path: PathBuf,
     },
 }
 

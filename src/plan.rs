@@ -109,11 +109,7 @@ pub fn build_plan(
             }
             Verdict::Quarantine => {
                 if profile.copy_quarantine {
-                    let base = profile
-                        .quarantine
-                        .clone()
-                        .unwrap_or_else(|| profile.destination.join("_quarantine"));
-                    (None, Some(base.join(&group.name)))
+                    (None, Some(profile.quarantine_root().join(&group.name)))
                 } else {
                     // copy_quarantine: false — leave source in place;
                     // no path to transfer to.

@@ -67,7 +67,7 @@ Common fields, available to every profile:
 | `layout`        | Path template under `destination`, resolved per media group      |
 | `timezone`      | IANA timezone name for `{date:...}` layout fields and mtime stamping (e.g. `Europe/Vilnius`); defaults to the system timezone |
 | `ignore`        | Glob patterns for files to skip entirely                         |
-| `quarantine`    | Where footage that doesn't meet the keep criteria goes           |
+| `quarantine`    | Where footage that doesn't meet the keep criteria goes; defaults to `{destination}/_quarantine`. Purged with `cleanup` |
 | `delete_source` | Delete source files after a verified transfer (per-run: `--keep-source` overrides) |
 | `copy_quarantine` | Copy quarantined footage to the quarantine folder (default `true`). Set to `false` to leave it on the source untouched — it is still reported as `QUARANTINE` in `scan` output, but no copy is made and no quarantine directory is created. A file left in place is never a deletion candidate, so `delete_source` cannot remove it. |
 
@@ -168,6 +168,8 @@ loads, not partway through an import.
 
 ## Usage
 
+### `scan` / `import`
+
 Always scan before importing — it's read-only and shows exactly what
 `import` would do:
 
@@ -178,6 +180,11 @@ import-videos scan commute
 ```sh
 import-videos import commute
 ```
+
+On multi-GB transfers, `import` shows a byte-level progress bar while stdout
+is an interactive terminal and `--json` is off; it's silent (no progress, no
+terminal-control bytes) when stdout is piped or `--json` is set, so scripted
+and redirected runs stay clean.
 
 Useful flags:
 
@@ -191,13 +198,99 @@ Useful flags:
   re-hashing gigabytes of video. Files accepted this way are never deletion
   candidates (ADR 0009). Recipe: `import <profile> --quick-match --keep-source`
   re-imports metadata and rewrites sidecars cheaply.
+
+### `cleanup`
+
+Purges a profile's quarantine directory — the operational tail to `scan`'s
+`QUARANTINE` verdicts. Same plan/confirm/execute safety model as `import`
+(ADR 0003): a purge plan is always built and shown before anything is
+deleted.
+
+```sh
+import-videos cleanup commute --dry-run
+import-videos cleanup commute --older-than 30d --yes
+```
+
+- `--older-than <span>` — only purge entries that have sat in quarantine
+  longer than this (jiff friendly-format span, e.g. `30d`, `2w`, `1mo`).
+  Without it, every entry is a candidate. Age is measured from each entry's
+  own arrival in quarantine — the group directory's mtime, not the
+  recording-stamped mtimes of the files inside it (ADR 0010) — so footage
+  recorded months ago but only quarantined yesterday is not purged
+  immediately.
+- `--dry-run` — print the purge plan and exit without deleting anything
+- `--yes` — skip the confirmation prompt before deleting
+
+`cleanup` only ever touches the profile's resolved quarantine directory
+(`quarantine`, or `{destination}/_quarantine`); it refuses to run (exit 2,
+nothing deleted) if that directory would equal or contain the destination.
+
+### `inspect`
+
+Dumps one file's device metadata for debugging and card triage — no profile
+and no config file required:
+
+```sh
+import-videos inspect /media/alice/GOPRO/DCIM/100GOPRO/GX010123.MP4
+import-videos inspect /media/alice/TESLA/TeslaCam/SavedClips/2026-07-04_18-23-51/
+```
+
+For a GoPro `.mp4`: HiLight marker count and per-marker offset/timestamp,
+the camera's creation time, and — when a `gpmd` telemetry track is present —
+a GPS summary (first usable fix, clock offset from the camera clock, sample
+count). For a Tesla event folder (or an `event.json` path directly): the
+parsed `timestamp`/`reason`/`city`/coordinates plus the clip files present
+alongside it. Parsing is read-only and never modifies the file. A section
+that fails to parse (e.g. a corrupt `gpmd` track) still lets the rest of the
+dump print — the command exits 1 to signal the partial failure. An
+unsupported path (anything that's neither) is a usage error, exit 2.
+
+### Global flags
+
+- `--json` — emit the result as a single JSON document on stdout instead of
+  human-readable text, for every subcommand (`scan`, `import`, `cleanup`,
+  `inspect`). No other stdout output is produced in this mode; errors still
+  go to stderr and exit codes are unchanged. Confirmation prompts still
+  apply — `--json` does not imply `--yes`. See "JSON output" below for the
+  shape.
 - `-v` / `-vv` — increase log verbosity; also expands the plan output (`scan` /
   `import --dry-run`): shows quarantined sessions and per-marker details,
   which are otherwise collapsed into the closing summary line
 - `--config PATH` — use a config file other than the default
 
-Exit codes: `0` success (including "nothing to import"), `1` if any
-planned action failed, `2` on a configuration or usage error.
+Exit codes: `0` success (including "nothing to import" / "nothing to
+clean"), `1` if any planned action failed (or, for `inspect`, if a section
+of the dump failed to parse), `2` on a configuration or usage error.
+
+### JSON output
+
+**v0 — the field set may still evolve.** No breaking changes are planned,
+but this hasn't been used against real scripts long enough to freeze yet;
+treat unfamiliar fields as forward-compatible additions rather than errors.
+
+Every JSON document is built from dedicated view-model types (`src/report.rs`),
+not by serializing internal domain types directly, so the shape is
+deliberate rather than an accident of refactoring. Timestamps are RFC 3339
+strings in the configured timezone; paths are strings.
+
+- `scan --json` / `import --dry-run --json` — the plan: `actions[]` (group,
+  verdict, reason, path, markers, sidecar path) and a `summary` (kept/
+  quarantined/ignored/total counts). Unlike the human output, quarantined
+  entries are always included.
+- `import --json` — the execution report: `groups[]` (per-file outcomes,
+  sidecar outcome, whether the group was deleted from source),
+  `deletion_skipped_reason`, and a `summary` (transferred/failed/deleted
+  counts).
+- `cleanup --json` — the purge plan (`entries[]` with name, age, size,
+  purge flag, and a summary) for a dry run, or the deletion results
+  (`results[]`, `aborted_reason`) once executed.
+- `inspect --json` — the metadata dump: raw millisecond offsets alongside
+  rendered timestamps for GoPro, or the parsed Tesla event fields; any
+  section that failed to parse carries its own `..._error` field instead of
+  data.
+- A "nothing found" outcome (`scan`/`import` with no sources; `cleanup`
+  with an empty quarantine) is still a JSON document — `{"status":
+  "no_sources", "profile": "..."}` for the former — never a bare string.
 
 ## Development
 
