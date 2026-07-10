@@ -10,6 +10,8 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
+use jiff::Timestamp;
+
 use crate::error::{Error, Result};
 use crate::plan::ImportPlan;
 use crate::source::{Sidecar, Verdict};
@@ -89,7 +91,7 @@ pub fn execute(
         let mut files = Vec::with_capacity(action.group.files.len());
         if let Some(dir) = target_dir {
             for media_file in &action.group.files {
-                let outcome = transfer_file(&media_file.path, dir)?;
+                let outcome = transfer_file(&media_file.path, dir, media_file.recorded_at)?;
                 files.push(FileResult {
                     src: media_file.path.clone(),
                     outcome,
@@ -224,16 +226,27 @@ fn write_sidecar_inner(dir: &Path, sidecar: &Sidecar) -> Result<()> {
 /// error or hash mismatch — removes the `.part` file and leaves `src`
 /// untouched, reported as `TransferOutcome::Failed` rather than
 /// propagated, so the caller can keep processing the rest of the plan.
-pub fn transfer_file(src: &Path, dest_dir: &Path) -> Result<TransferOutcome> {
+/// `recorded_at`, when given, stamps the destination's mtime after the
+/// verified rename (gopro-telemetry design D8) — never for a file
+/// that's skipped as already-imported.
+pub fn transfer_file(
+    src: &Path,
+    dest_dir: &Path,
+    recorded_at: Option<Timestamp>,
+) -> Result<TransferOutcome> {
     fs::create_dir_all(dest_dir).map_err(|e| Error::io(dest_dir, e))?;
 
-    match transfer_inner(src, dest_dir) {
+    match transfer_inner(src, dest_dir, recorded_at) {
         Ok(outcome) => Ok(outcome),
         Err(e) => Ok(TransferOutcome::Failed(e.to_string())),
     }
 }
 
-fn transfer_inner(src: &Path, dest_dir: &Path) -> Result<TransferOutcome> {
+fn transfer_inner(
+    src: &Path,
+    dest_dir: &Path,
+    recorded_at: Option<Timestamp>,
+) -> Result<TransferOutcome> {
     let file_name = src.file_name().ok_or_else(|| {
         Error::io(
             src,
@@ -273,11 +286,33 @@ fn transfer_inner(src: &Path, dest_dir: &Path) -> Result<TransferOutcome> {
 
     fs::rename(&part_path, &final_path).map_err(|e| Error::io(&final_path, e))?;
 
+    if let Some(recorded_at) = recorded_at {
+        stamp_mtime(&final_path, recorded_at);
+    }
+
     Ok(if suffixed {
         TransferOutcome::Suffixed(final_path)
     } else {
         TransferOutcome::Transferred
     })
+}
+
+/// Sets `path`'s modification time to `recorded_at` (design D8). The
+/// verified copy is already complete and correct at this point, so a
+/// failure here is metadata-only: log and move on rather than fail the
+/// transfer (spec: "mtime failure does not fail the import").
+fn stamp_mtime(path: &Path, recorded_at: Timestamp) {
+    let result = File::options()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(std::time::SystemTime::from(recorded_at)));
+    if let Err(error) = result {
+        tracing::warn!(
+            file = %path.display(),
+            %error,
+            "could not set destination file's modification time"
+        );
+    }
 }
 
 /// Picks the path a file should land at: `None` if a file with
@@ -364,6 +399,7 @@ mod tests {
             files: vec![MediaFile {
                 path: path.to_path_buf(),
                 size: 7,
+                recorded_at: None,
             }],
             timestamp: ts(0),
             markers: vec![],
@@ -402,7 +438,7 @@ mod tests {
         fs::write(&src, b"hello").unwrap();
         let dest_dir = dir.path().join("dest");
 
-        let outcome = transfer_file(&src, &dest_dir).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, None).unwrap();
         assert_eq!(outcome, TransferOutcome::Transferred);
         assert_eq!(fs::read(dest_dir.join("clip.mp4")).unwrap(), b"hello");
         assert!(src.exists(), "transfer never deletes the source");
@@ -418,8 +454,130 @@ mod tests {
         fs::create_dir_all(&dest_dir).unwrap();
         fs::write(dest_dir.join("clip.mp4"), b"hello").unwrap();
 
-        let outcome = transfer_file(&src, &dest_dir).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, None).unwrap();
         assert_eq!(outcome, TransferOutcome::SkippedIdentical);
+    }
+
+    // --- mtime stamping (gopro-telemetry design D8) ---
+
+    #[test]
+    fn mtime_stamped_to_recorded_time_after_transfer() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let recorded_at: Timestamp = "2026-07-09T07:41:03Z".parse().unwrap();
+        let outcome = transfer_file(&src, &dest_dir, Some(recorded_at)).unwrap();
+        assert_eq!(outcome, TransferOutcome::Transferred);
+
+        let dest_path = dest_dir.join("clip.mp4");
+        let mtime = fs::metadata(&dest_path).unwrap().modified().unwrap();
+        assert_eq!(Timestamp::try_from(mtime).unwrap(), recorded_at);
+        assert_eq!(
+            fs::read(&dest_path).unwrap(),
+            b"hello",
+            "content stays byte-identical"
+        );
+    }
+
+    #[test]
+    fn mtime_stamped_for_quarantine_transfer_too() {
+        // design D8: "destination and quarantine transfers alike" —
+        // routed through `execute` rather than calling `transfer_file`
+        // directly, to exercise the real quarantine path.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello").unwrap();
+        let quarantine_dir = dir.path().join("quarantine");
+
+        let recorded_at: Timestamp = "2026-07-09T07:41:03Z".parse().unwrap();
+        let group = MediaGroup {
+            name: "session".to_string(),
+            files: vec![MediaFile {
+                path: src.clone(),
+                size: 5,
+                recorded_at: Some(recorded_at),
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group,
+                verdict: Verdict::Quarantine,
+                destination: None,
+                quarantine_path: Some(quarantine_dir.clone()),
+            }],
+        };
+
+        execute(&plan, false, false, false).unwrap();
+
+        let mtime = fs::metadata(quarantine_dir.join("clip.mp4"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        assert_eq!(Timestamp::try_from(mtime).unwrap(), recorded_at);
+    }
+
+    #[test]
+    fn skipped_identical_file_mtime_is_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello").unwrap();
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let dest_path = dest_dir.join("clip.mp4");
+        fs::write(&dest_path, b"hello").unwrap();
+
+        // A distinctive mtime far from "now" and from the recorded_at
+        // below, so any accidental touch is detectable.
+        let original_mtime =
+            std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        File::options()
+            .write(true)
+            .open(&dest_path)
+            .unwrap()
+            .set_modified(original_mtime)
+            .unwrap();
+
+        let recorded_at: Timestamp = "2026-07-09T07:41:03Z".parse().unwrap();
+        let outcome = transfer_file(&src, &dest_dir, Some(recorded_at)).unwrap();
+        assert_eq!(outcome, TransferOutcome::SkippedIdentical);
+
+        let mtime_after = fs::metadata(&dest_path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_after, original_mtime,
+            "skipped-identical file must not be touched"
+        );
+    }
+
+    #[test]
+    fn no_recorded_at_leaves_mtime_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let outcome = transfer_file(&src, &dest_dir, None).unwrap();
+        assert_eq!(outcome, TransferOutcome::Transferred);
+        // No panic and a normal outcome is the whole point here: with
+        // `recorded_at: None`, `transfer_inner` never calls
+        // `stamp_mtime` at all.
+    }
+
+    #[test]
+    fn mtime_stamp_failure_is_logged_not_propagated() {
+        // Exercises `stamp_mtime` directly against a path that can't be
+        // opened, standing in for a filesystem that rejects the mtime
+        // change (spec: "mtime failure does not fail the import") —
+        // the function has no `Result` to check; this test's only
+        // assertion is that it returns instead of panicking.
+        let missing = Path::new("/nonexistent-dir-for-import-videos-test/clip.mp4");
+        stamp_mtime(missing, Timestamp::UNIX_EPOCH);
     }
 
     #[test]
@@ -497,7 +655,7 @@ mod tests {
         fs::create_dir_all(&dest_dir).unwrap();
         fs::write(dest_dir.join("clip.mp4"), b"old-bytes").unwrap();
 
-        let outcome = transfer_file(&src, &dest_dir).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, None).unwrap();
         let TransferOutcome::Suffixed(path) = outcome else {
             panic!("expected Suffixed, got different outcome");
         };

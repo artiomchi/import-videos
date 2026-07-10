@@ -3,4 +3,5 @@
 //! pipeline actually needs (`moov/udta/HMMT`, `moov/mvhd`) and skips
 //! everything else by seeking past it.
 
+pub mod gpmf;
 pub mod mp4;

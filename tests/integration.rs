@@ -71,6 +71,7 @@ fn media_file(path: &Path) -> MediaFile {
     MediaFile {
         path: path.to_path_buf(),
         size: fs::metadata(path).unwrap().len(),
+        recorded_at: None,
     }
 }
 

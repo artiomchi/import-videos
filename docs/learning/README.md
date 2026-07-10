@@ -16,3 +16,4 @@ Keep notes under a page. Link related ADRs.
 - [lib.rs + thin main.rs](lib-bin-split.md) — why the logic lives in a testable library, not the binary
 - [Trait objects vs. generics](trait-objects-vs-generics.md) — why `ImportSource` dispatch uses `Box<dyn Trait>`
 - [Binary parsing with std](binary-parsing-with-std.md) — reading MP4 boxes with `Read`/`Seek`, no parser crate
+- [Iterators and lifetimes in stream parsing](iterators-lifetimes-in-stream-parsing.md) — `KlvIter<'a>`'s borrowed items vs. `mp4.rs`'s owned, `Read`-based walker

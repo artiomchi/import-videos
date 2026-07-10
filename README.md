@@ -73,9 +73,27 @@ several chapters. A HiLight marker (the side-button press) anywhere in the
 session keeps the *whole* session; a session with no markers is quarantined,
 not deleted. Set `require_marker: false` to keep every session regardless.
 Kept sessions get a `markers.json` sidecar recording the camera model,
-session id, chapter files, and each marker's chapter, millisecond offset,
-and camera-clock timestamp (`"time_source": "camera"` — GPS-corrected times
-arrive in a later changeset).
+session id, and chapter files. HERO8 chapters carry a GPMF telemetry track
+(`gpmd`) with GPS fixes and GPS-derived UTC; when it's present and usable
+(at least a 2D lock, DOP ≤ 5.0), the session's timestamp — and so its
+`{date:...}` destination folder — is the GPS-corrected UTC instant rather
+than the camera's clock, which drifts and (on GoPros) is local time
+mismarked as UTC. The sidecar then records `"time_source": "gps"`, the
+session's `clock_offset_s`, and each marker's corrected `utc` plus `lat`/
+`lon` (omitted for a marker with no nearby fix). Imported files' mtime is
+set to this corrected recording time after the verified copy completes —
+file content is untouched either way. Without usable telemetry (no `gpmd`
+track, no fix, or unparseable data), everything falls back to today's
+behavior: camera-clock timestamp, `"time_source": "camera"`, each marker's
+`camera_time`. A telemetry problem is logged and never fails or requeues an
+import — it only ever affects timestamps, never the Keep/Quarantine
+verdict.
+
+Destination dates stay UTC-based even with GPS correction: a session that
+crosses midnight UTC lands in the UTC calendar date, which can read as the
+"wrong" local day for a late-evening ride. A `{date:local:...}` layout
+field to resolve against local time instead is a possible future addition,
+not something this changeset does.
 
 `layout` is a small template language: `{date:%Y}/{date:%Y-%m-%d}` resolves
 `{date...}` against the media group's timestamp via

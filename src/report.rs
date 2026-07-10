@@ -5,7 +5,7 @@
 use std::fmt::Write;
 
 use crate::plan::ImportPlan;
-use crate::source::Verdict;
+use crate::source::{Sidecar, Verdict};
 use crate::transfer::{ExecuteReport, TransferOutcome};
 
 /// Renders every planned action: verdict, reason, and resolved path.
@@ -60,6 +60,11 @@ pub fn render_plan(plan: &ImportPlan, verbose: bool) -> String {
         let _ = writeln!(out);
 
         if verbose {
+            let _ = write!(out, "  recorded at: {}", action.group.timestamp);
+            if let Some(source) = time_source(action.group.sidecar.as_ref()) {
+                let _ = write!(out, " (source: {source})");
+            }
+            let _ = writeln!(out);
             for marker in &action.group.markers {
                 let _ = write!(out, "  marker at {}", marker.timestamp);
                 if let Some(label) = &marker.label {
@@ -89,6 +94,16 @@ pub fn render_plan(plan: &ImportPlan, verbose: bool) -> String {
     );
 
     out
+}
+
+/// A device's sidecar may note where a group's timestamp came from
+/// (e.g. GoPro's `"time_source": "gps"`/`"camera"`) — read directly out
+/// of the sidecar's JSON as an optional, soft convention rather than a
+/// dedicated `MediaGroup` field, since it's device-specific and not
+/// every device (or every group — quarantined groups have no sidecar
+/// at all) will have one.
+fn time_source(sidecar: Option<&Sidecar>) -> Option<&str> {
+    sidecar?.content.get("time_source")?.as_str()
 }
 
 /// Renders the outcome of executing a plan: per-file transfer results,
@@ -189,6 +204,7 @@ mod tests {
         assert!(out.contains("[KEEP] kept"));
         assert!(!out.contains("QUARANTINE"));
         assert!(!out.contains("marker at"));
+        assert!(!out.contains("recorded at:"));
         assert!(out.contains("Summary: 1 kept, 1 quarantined, 0 ignored (2 total)"));
     }
 
@@ -205,6 +221,38 @@ mod tests {
         assert!(out.contains("[KEEP] kept"));
         assert!(out.contains("[QUARANTINE] unmarked"));
         assert!(out.contains("marker at 1970-01-01T00:16:40Z"));
+        assert!(
+            out.contains("recorded at: 1970-01-01T00:00:00Z"),
+            "verbose mode should show the group's (GPS-corrected, when available) recorded time"
+        );
         assert!(out.contains("Summary: 1 kept, 1 quarantined, 0 ignored (2 total)"));
+    }
+
+    #[test]
+    fn recorded_at_has_no_source_annotation_without_a_sidecar() {
+        let plan = plan_with_one_keep_one_quarantine(vec![]);
+        let out = render_plan(&plan, true);
+        assert!(!out.contains("(source:"));
+    }
+
+    #[test]
+    fn recorded_at_shows_time_source_from_sidecar() {
+        let mut kept = group("kept", vec![]);
+        kept.sidecar = Some(Sidecar {
+            filename: "markers.json".to_string(),
+            content: serde_json::json!({"time_source": "gps"}),
+        });
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group: kept,
+                verdict: Verdict::Keep,
+                destination: Some(PathBuf::from("/dest/kept")),
+                quarantine_path: None,
+            }],
+        };
+
+        let out = render_plan(&plan, true);
+
+        assert!(out.contains("recorded at: 1970-01-01T00:00:00Z (source: gps)"));
     }
 }

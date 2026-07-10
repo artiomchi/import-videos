@@ -18,6 +18,12 @@ use crate::error::Result;
 pub struct MediaFile {
     pub path: PathBuf,
     pub size: u64,
+    /// When this file was actually recorded (GPS-corrected when a
+    /// device module has telemetry, camera-clock otherwise); `None`
+    /// when the device has no notion of a per-file recording time.
+    /// The transfer engine stamps the destination file's mtime from
+    /// this after verified copy (design D8, ADR 0003).
+    pub recorded_at: Option<Timestamp>,
 }
 
 /// A point of interest within a group's footage (e.g. a GoPro HiLight
