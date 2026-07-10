@@ -92,7 +92,7 @@ fn scan_profile(
         return Ok(None);
     };
 
-    let import_plan = plan::build_plan(profile, source_impl.as_ref(), &root)?;
+    let import_plan = plan::build_plan(profile, source_impl.as_ref(), &root, &cfg.timezone)?;
     if import_plan.actions.is_empty() {
         return Ok(None);
     }
@@ -109,7 +109,10 @@ fn run_scan(
         None => {
             println!("no sources found for profile '{profile_name}'");
         }
-        Some(import_plan) => print!("{}", report::render_plan(&import_plan, verbose)),
+        Some(import_plan) => print!(
+            "{}",
+            report::render_plan(&import_plan, verbose, &cfg.timezone)
+        ),
     }
     Ok(ExitCode::Success)
 }
@@ -131,7 +134,10 @@ fn run_import(
     };
 
     if dry_run {
-        print!("{}", report::render_plan(&import_plan, verbose));
+        print!(
+            "{}",
+            report::render_plan(&import_plan, verbose, &cfg.timezone)
+        );
         return Ok(ExitCode::Success);
     }
 

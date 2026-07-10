@@ -5,9 +5,11 @@
 
 use std::path::{Path, PathBuf};
 
+use jiff::Timestamp;
+
 use crate::config::{Profile, SourceLocation};
 use crate::error::{Error, Result};
-use crate::source::{ImportSource, MediaGroup, Verdict};
+use crate::source::{ImportSource, MediaGroup, ScanContext, Verdict};
 
 /// A `MediaGroup` paired with its verdict and fully resolved
 /// destination (`Keep`) or quarantine (`Quarantine`) directory. Every
@@ -87,14 +89,22 @@ pub fn build_plan(
     profile: &Profile,
     source_impl: &dyn ImportSource,
     source_root: &Path,
+    timezone: &jiff::tz::TimeZone,
 ) -> Result<ImportPlan> {
-    let groups = source_impl.scan(source_root, &profile.ignore)?;
+    let ctx = ScanContext {
+        ignore: &profile.ignore,
+        tz: timezone,
+        imported_at: Timestamp::now(),
+    };
+    let groups = source_impl.scan(source_root, &ctx)?;
     let mut actions = Vec::with_capacity(groups.len());
 
     for (group, verdict) in groups {
         let (destination, quarantine_path) = match &verdict {
             Verdict::Keep => {
-                let relative = profile.layout.resolve(&group.context, group.timestamp)?;
+                let relative = profile
+                    .layout
+                    .resolve(&group.context, group.timestamp, timezone)?;
                 (Some(profile.destination.join(relative)), None)
             }
             Verdict::Quarantine => {
@@ -128,7 +138,7 @@ mod tests {
     use super::*;
     use crate::config::{LayoutTemplate, SourceKind};
     use crate::error;
-    use crate::source::MediaGroup;
+    use crate::source::{MediaGroup, ScanContext};
     use globset::GlobSetBuilder;
     use std::collections::HashMap;
 
@@ -160,7 +170,7 @@ mod tests {
         fn scan(
             &self,
             _root: &Path,
-            _ignore: &globset::GlobSet,
+            _ctx: &ScanContext,
         ) -> error::Result<Vec<(MediaGroup, Verdict)>> {
             Ok(self.groups.clone())
         }
@@ -185,7 +195,7 @@ mod tests {
         let source = StubSource {
             groups: vec![(quarantine_group(), Verdict::Quarantine)],
         };
-        let plan = build_plan(&prof, &source, Path::new("/src")).unwrap();
+        let plan = build_plan(&prof, &source, Path::new("/src"), &jiff::tz::TimeZone::UTC).unwrap();
         let action = &plan.actions[0];
         assert!(
             action.quarantine_path.is_some(),
@@ -203,7 +213,7 @@ mod tests {
         let source = StubSource {
             groups: vec![(quarantine_group(), Verdict::Quarantine)],
         };
-        let plan = build_plan(&prof, &source, Path::new("/src")).unwrap();
+        let plan = build_plan(&prof, &source, Path::new("/src"), &jiff::tz::TimeZone::UTC).unwrap();
         let action = &plan.actions[0];
         assert_eq!(
             action.quarantine_path, None,

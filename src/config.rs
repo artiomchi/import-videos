@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use globset::{Glob, GlobSet, GlobSetBuilder};
+use jiff::tz::TimeZone;
 use serde::{Deserialize, Serialize};
 
 pub use layout::LayoutTemplate;
@@ -104,12 +105,20 @@ pub struct Profile {
 pub struct Config {
     pub profiles: HashMap<String, Profile>,
     pub mount_roots: Vec<PathBuf>,
+    /// Resolved IANA timezone (default: system local). Every rendered
+    /// timestamp — layout paths, sidecar fields, logs — formats through
+    /// this zone. Device wall clocks are also *interpreted* in it.
+    pub timezone: TimeZone,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 struct RawConfig {
     #[serde(default)]
     mount_roots: Option<Vec<String>>,
+    /// Optional IANA timezone name. Unset → system local; unknown name →
+    /// `Error::Config` (exit 2).
+    #[serde(default)]
+    timezone: Option<String>,
     // Kept as raw YAML values, not `RawProfile`, so `load` can check
     // for `require_marker` on the wrong device type before that field
     // gets silently swallowed by the flattened, internally-tagged
@@ -173,6 +182,15 @@ pub fn load(path: &Path) -> Result<Config> {
         .map(|s| expand_tilde(s))
         .collect();
 
+    let timezone = match raw.timezone {
+        None => TimeZone::system(),
+        Some(ref name) => TimeZone::get(name).map_err(|_| {
+            Error::Config(format!(
+                "timezone: unrecognized IANA timezone name '{name}'"
+            ))
+        })?,
+    };
+
     let mut profiles = HashMap::with_capacity(raw.profiles.len());
     for (name, raw_value) in raw.profiles {
         let has_require_marker = raw_value
@@ -205,6 +223,7 @@ pub fn load(path: &Path) -> Result<Config> {
     Ok(Config {
         profiles,
         mount_roots,
+        timezone,
     })
 }
 
@@ -644,5 +663,68 @@ profiles:
             !cfg.profiles.get("cam").unwrap().copy_quarantine,
             "copy_quarantine: false must load as false"
         );
+    }
+
+    // --- Timezone config (unify-timestamps-and-sidecars) ---
+
+    #[test]
+    fn explicit_valid_timezone_loads() {
+        // Spec scenario: "Explicit timezone loads"
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "timezone: Europe/Vilnius\nprofiles:\n  cam:\n    type: generic\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = load(&path).unwrap();
+        // The zone should be Europe/Vilnius; round-trip via IANA name.
+        assert_eq!(cfg.timezone.iana_name(), Some("Europe/Vilnius"));
+    }
+
+    #[test]
+    fn invalid_timezone_rejected_at_load() {
+        // Spec scenario: "Invalid timezone rejected at load"
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "timezone: Mars/Olympus\nprofiles:\n  cam:\n    type: generic\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&path).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("timezone"));
+        assert_eq!(err.exit_code(), crate::error::ExitCode::UsageOrConfig);
+    }
+
+    #[test]
+    fn unset_timezone_defaults_to_system_local() {
+        // Spec scenario: "Unset timezone defaults to system local"
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  cam:\n    type: generic\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        // Should load without error; we can't assert the exact zone
+        // (system-dependent), just that it loads.
+        let cfg = load(&path).unwrap();
+        // system() zones may not have an IANA name on all hosts, so
+        // just confirm the config loads successfully.
+        let _ = cfg.timezone;
     }
 }

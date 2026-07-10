@@ -79,7 +79,7 @@ fn gopro_config(config_path: &Path, destination: &Path, extra: &str) {
     write_config(
         config_path,
         &format!(
-            "profiles:\n  gopro:\n    type: gopro\n    source: auto\n    destination: {}\n    layout: \"{{date:%Y}}/{{date:%Y-%m-%d}}\"\n{extra}",
+            "timezone: UTC\nprofiles:\n  gopro:\n    type: gopro\n    source: auto\n    destination: {}\n    layout: \"{{date:%Y}}/{{date:%Y-%m-%d}}\"\n{extra}",
             destination.display()
         ),
     );
@@ -142,8 +142,8 @@ fn marked_session_kept_unmarked_session_quarantined_and_source_cleaned() {
         "marked session should land under the date layout"
     );
     assert!(
-        dest.join("2026/2026-07-09/markers.json").exists(),
-        "kept session should get a markers.json sidecar"
+        dest.join("2026/2026-07-09/import.json").exists(),
+        "kept session should get a import.json sidecar"
     );
 
     let quarantined = dest.join("_quarantine/session-0124/GX010124.MP4");
@@ -152,7 +152,7 @@ fn marked_session_kept_unmarked_session_quarantined_and_source_cleaned() {
         "unmarked session should land in quarantine, not be deleted"
     );
     assert!(
-        !dest.join("_quarantine/session-0124/markers.json").exists(),
+        !dest.join("_quarantine/session-0124/import.json").exists(),
         "quarantined sessions get no sidecar"
     );
 
@@ -200,7 +200,7 @@ fn scan_and_dry_run_are_read_only() {
     let stdout = String::from_utf8_lossy(&scan_output.stdout);
     assert!(stdout.contains("KEEP"));
     assert!(stdout.contains("session-0123"));
-    assert!(stdout.contains("markers.json"));
+    assert!(stdout.contains("import.json"));
     assert!(!dest.exists(), "scan must not create the destination");
     assert_eq!(tree_snapshot(&card), card_before);
 

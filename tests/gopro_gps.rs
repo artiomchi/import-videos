@@ -288,7 +288,7 @@ fn gopro_config(config_path: &Path, destination: &Path, extra: &str) {
     write_config(
         config_path,
         &format!(
-            "profiles:\n  gopro:\n    type: gopro\n    source: auto\n    destination: {}\n    layout: \"{{date:%Y}}/{{date:%Y-%m-%d}}\"\n{extra}",
+            "timezone: UTC\nprofiles:\n  gopro:\n    type: gopro\n    source: auto\n    destination: {}\n    layout: \"{{date:%Y}}/{{date:%Y-%m-%d}}\"\n{extra}",
             destination.display()
         ),
     );
@@ -350,14 +350,14 @@ fn gps_corrected_session_lands_in_gps_dated_folder_with_full_sidecar() {
     );
     assert!(!dest.join("2026/2026-07-10").exists());
 
-    let sidecar = read_sidecar(&dest.join("2026/2026-07-09/markers.json"));
+    let sidecar = read_sidecar(&dest.join("2026/2026-07-09/import.json"));
     assert_eq!(sidecar["time_source"], "gps");
-    let offset = sidecar["clock_offset_s"].as_f64().unwrap();
+    let offset = sidecar["gopro"]["clock_offset_s"].as_f64().unwrap();
     assert!((offset - (-3612.0)).abs() < 0.01, "offset was {offset}");
 
-    let marker = &sidecar["markers"][0];
+    let marker = &sidecar["events"][0];
     assert_eq!(marker["offset_ms"], 500);
-    assert!(marker.get("utc").is_some());
+    assert!(marker.get("time").is_some());
     assert!(marker.get("camera_time").is_none());
     assert!(marker.get("lat").is_some());
     assert!(marker.get("lon").is_some());
@@ -399,12 +399,12 @@ fn card_without_gpmd_track_imports_with_camera_clock_sidecar() {
     assert_eq!(status.code(), Some(0));
 
     assert!(dest.join("2026/2026-07-09/GX010200.MP4").exists());
-    let sidecar = read_sidecar(&dest.join("2026/2026-07-09/markers.json"));
+    let sidecar = read_sidecar(&dest.join("2026/2026-07-09/import.json"));
     assert_eq!(sidecar["time_source"], "camera");
-    assert!(sidecar.get("clock_offset_s").is_none());
-    let marker = &sidecar["markers"][0];
-    assert!(marker.get("camera_time").is_some());
-    assert!(marker.get("utc").is_none());
+    assert!(sidecar["gopro"].get("clock_offset_s").is_none());
+    let marker = &sidecar["events"][0];
+    assert!(marker.get("time").is_some());
+    assert!(marker.get("camera_time").is_none());
 }
 
 #[test]
@@ -442,7 +442,7 @@ fn corrupt_telemetry_degrades_to_camera_clock_without_aborting() {
     );
 
     assert!(dest.join("2026/2026-07-09/GX010201.MP4").exists());
-    let sidecar = read_sidecar(&dest.join("2026/2026-07-09/markers.json"));
+    let sidecar = read_sidecar(&dest.join("2026/2026-07-09/import.json"));
     assert_eq!(sidecar["time_source"], "camera");
 }
 

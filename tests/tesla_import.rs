@@ -27,7 +27,7 @@ fn tesla_config(config_path: &Path, destination: &Path, extra: &str) {
     write(
         config_path,
         &format!(
-            "profiles:\n  tesla:\n    type: tesla\n    source: auto\n    destination: {}\n    layout: \"{{event_type}}/{{event_date}}/{{event_time}}\"\n{extra}",
+            "timezone: UTC\nprofiles:\n  tesla:\n    type: tesla\n    source: auto\n    destination: {}\n    layout: \"{{event_type}}/{{date:%Y-%m-%d}}/{{date:%H-%M-%S}}\"\n{extra}",
             destination.display()
         ),
     );
@@ -148,8 +148,8 @@ fn event_folder_imports_as_one_unit_with_sidecar() {
     let sidecar: serde_json::Value =
         serde_json::from_slice(&fs::read(landing.join("import.json")).unwrap()).unwrap();
     assert_eq!(sidecar["camera"], "tesla");
-    assert_eq!(sidecar["event_type"], "saved");
-    assert_eq!(sidecar["event"]["reason"], "user_interaction_honk");
+    assert_eq!(sidecar["events"][0]["type"], "tesla:saved");
+    assert_eq!(sidecar["events"][0]["reason"], "user_interaction_honk");
     assert_eq!(sidecar["time_source"], "event_json");
 
     assert!(

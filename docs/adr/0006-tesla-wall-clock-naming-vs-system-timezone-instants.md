@@ -1,6 +1,6 @@
 # 0006 — Tesla: vehicle-local wall-clock naming vs. system-timezone instants
 
-- Status: accepted
+- Status: superseded by ADR 0008
 - Date: 2026-07-10
 
 ## Context

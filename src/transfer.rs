@@ -670,7 +670,7 @@ mod tests {
         let dest_dir = dir.path().join("dest");
 
         let sidecar = Sidecar {
-            filename: "markers.json".to_string(),
+            filename: "import.json".to_string(),
             content: serde_json::json!({"camera": "gopro-hero8"}),
         };
         let plan = ImportPlan {
@@ -689,7 +689,7 @@ mod tests {
             Some(TransferOutcome::Transferred)
         ));
         let content: serde_json::Value =
-            serde_json::from_slice(&fs::read(dest_dir.join("markers.json")).unwrap()).unwrap();
+            serde_json::from_slice(&fs::read(dest_dir.join("import.json")).unwrap()).unwrap();
         assert_eq!(content, serde_json::json!({"camera": "gopro-hero8"}));
     }
 
@@ -700,10 +700,10 @@ mod tests {
         fs::write(&src, b"footage").unwrap();
         let dest_dir = dir.path().join("dest");
         // Occupy the sidecar's path with a directory so the write fails.
-        fs::create_dir_all(dest_dir.join("markers.json")).unwrap();
+        fs::create_dir_all(dest_dir.join("import.json")).unwrap();
 
         let sidecar = Sidecar {
-            filename: "markers.json".to_string(),
+            filename: "import.json".to_string(),
             content: serde_json::json!({}),
         };
         let plan = ImportPlan {

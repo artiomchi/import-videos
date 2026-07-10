@@ -18,7 +18,7 @@ use std::process::{Command, Stdio};
 use import_videos::config::{LayoutTemplate, Profile, SourceKind, SourceLocation};
 use import_videos::error;
 use import_videos::plan::{self, ImportPlan};
-use import_videos::source::{ImportSource, MediaFile, MediaGroup, Verdict};
+use import_videos::source::{ImportSource, MediaFile, MediaGroup, ScanContext, Verdict};
 use import_videos::transfer::{self, TransferOutcome};
 
 fn ts(secs: i64) -> jiff::Timestamp {
@@ -37,11 +37,7 @@ impl ImportSource for TestSource {
         true
     }
 
-    fn scan(
-        &self,
-        _root: &Path,
-        _ignore: &globset::GlobSet,
-    ) -> error::Result<Vec<(MediaGroup, Verdict)>> {
+    fn scan(&self, _root: &Path, _ctx: &ScanContext) -> error::Result<Vec<(MediaGroup, Verdict)>> {
         Ok(self.groups.clone())
     }
 }
@@ -130,7 +126,13 @@ fn scan_and_dry_run_perform_no_filesystem_changes() {
         groups: vec![(group("session", vec![media_file(&src)]), Verdict::Keep)],
     };
     let prof = profile(&dest, None, false);
-    let import_plan = plan::build_plan(&prof, &source_impl, &dir.path().join("source")).unwrap();
+    let import_plan = plan::build_plan(
+        &prof,
+        &source_impl,
+        &dir.path().join("source"),
+        &jiff::tz::TimeZone::UTC,
+    )
+    .unwrap();
 
     assert_eq!(import_plan.actions.len(), 1);
     assert_eq!(tree_snapshot(&dir.path().join("source")), source_before);
@@ -162,7 +164,13 @@ fn execution_follows_the_plan() {
         ],
     };
     let prof = profile(&dest, Some(quarantine.clone()), false);
-    let import_plan = plan::build_plan(&prof, &source_impl, Path::new("/ignored")).unwrap();
+    let import_plan = plan::build_plan(
+        &prof,
+        &source_impl,
+        Path::new("/ignored"),
+        &jiff::tz::TimeZone::UTC,
+    )
+    .unwrap();
 
     let report = transfer::execute(&import_plan, false, false, false).unwrap();
 
@@ -283,7 +291,13 @@ fn rerunning_import_is_idempotent() {
             groups: vec![(group("a", vec![media_file(&src)]), Verdict::Keep)],
         };
         let prof = profile(&dest, None, false);
-        plan::build_plan(&prof, &source_impl, Path::new("/ignored")).unwrap()
+        plan::build_plan(
+            &prof,
+            &source_impl,
+            Path::new("/ignored"),
+            &jiff::tz::TimeZone::UTC,
+        )
+        .unwrap()
     };
 
     let first = transfer::execute(&make_plan(), false, false, false).unwrap();
@@ -320,7 +334,13 @@ fn different_content_at_destination_gets_suffixed() {
         groups: vec![(group("a", vec![media_file(&src)]), Verdict::Keep)],
     };
     let prof = profile(&dir.path().join("dest"), None, false);
-    let import_plan = plan::build_plan(&prof, &source_impl, Path::new("/ignored")).unwrap();
+    let import_plan = plan::build_plan(
+        &prof,
+        &source_impl,
+        Path::new("/ignored"),
+        &jiff::tz::TimeZone::UTC,
+    )
+    .unwrap();
 
     let report = transfer::execute(&import_plan, false, false, false).unwrap();
 
@@ -345,7 +365,13 @@ fn keep_source_flag_overrides_delete_source() {
         groups: vec![(group("a", vec![media_file(&src)]), Verdict::Keep)],
     };
     let prof = profile(&dest, None, true); // delete_source: true
-    let import_plan = plan::build_plan(&prof, &source_impl, Path::new("/ignored")).unwrap();
+    let import_plan = plan::build_plan(
+        &prof,
+        &source_impl,
+        Path::new("/ignored"),
+        &jiff::tz::TimeZone::UTC,
+    )
+    .unwrap();
 
     // keep_source = true overrides the profile for this run.
     transfer::execute(&import_plan, prof.delete_source, true, true).unwrap();
@@ -366,7 +392,13 @@ fn delete_source_removes_file_after_confirmed_transfer() {
         groups: vec![(group("a", vec![media_file(&src)]), Verdict::Keep)],
     };
     let prof = profile(&dest, None, true);
-    let import_plan = plan::build_plan(&prof, &source_impl, Path::new("/ignored")).unwrap();
+    let import_plan = plan::build_plan(
+        &prof,
+        &source_impl,
+        Path::new("/ignored"),
+        &jiff::tz::TimeZone::UTC,
+    )
+    .unwrap();
 
     let report = transfer::execute(&import_plan, true, false, true).unwrap();
 
@@ -513,7 +545,13 @@ fn disabled_quarantine_copy_leaves_source_and_creates_no_dir() {
         copy_quarantine: false, // <-- the toggle under test
     };
 
-    let import_plan = plan::build_plan(&prof, &source_impl, Path::new("/ignored")).unwrap();
+    let import_plan = plan::build_plan(
+        &prof,
+        &source_impl,
+        Path::new("/ignored"),
+        &jiff::tz::TimeZone::UTC,
+    )
+    .unwrap();
     let report = transfer::execute(&import_plan, false, false, false).unwrap();
 
     // Source must be untouched.
@@ -574,7 +612,13 @@ fn disabled_quarantine_copy_source_not_deleted_even_with_delete_source() {
         copy_quarantine: false,
     };
 
-    let import_plan = plan::build_plan(&prof, &source_impl, Path::new("/ignored")).unwrap();
+    let import_plan = plan::build_plan(
+        &prof,
+        &source_impl,
+        Path::new("/ignored"),
+        &jiff::tz::TimeZone::UTC,
+    )
+    .unwrap();
     // assume_yes = true to skip the interactive prompt.
     let report = transfer::execute(&import_plan, true, false, true).unwrap();
 

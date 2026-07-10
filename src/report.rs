@@ -4,6 +4,8 @@
 
 use std::fmt::Write;
 
+use jiff::tz::TimeZone;
+
 use crate::plan::ImportPlan;
 use crate::source::{Sidecar, Verdict};
 use crate::transfer::{ExecuteReport, TransferOutcome};
@@ -19,7 +21,7 @@ use crate::transfer::{ExecuteReport, TransferOutcome};
 /// Marker details (per-marker timestamps) are likewise verbose-only.
 /// A summary line always closes the output, so counts are visible
 /// even when individual entries are suppressed.
-pub fn render_plan(plan: &ImportPlan, verbose: bool) -> String {
+pub fn render_plan(plan: &ImportPlan, verbose: bool, tz: &TimeZone) -> String {
     if plan.actions.is_empty() {
         return "No media found; nothing to import.\n".to_string();
     }
@@ -65,13 +67,19 @@ pub fn render_plan(plan: &ImportPlan, verbose: bool) -> String {
         let _ = writeln!(out);
 
         if verbose {
-            let _ = write!(out, "  recorded at: {}", action.group.timestamp);
+            let zoned = action.group.timestamp.to_zoned(tz.clone());
+            let rendered = jiff::fmt::strtime::format("%Y-%m-%dT%H:%M:%S%:z", &zoned)
+                .unwrap_or_else(|_| action.group.timestamp.to_string());
+            let _ = write!(out, "  recorded at: {rendered}");
             if let Some(source) = time_source(action.group.sidecar.as_ref()) {
                 let _ = write!(out, " (source: {source})");
             }
             let _ = writeln!(out);
             for marker in &action.group.markers {
-                let _ = write!(out, "  marker at {}", marker.timestamp);
+                let zoned_m = marker.timestamp.to_zoned(tz.clone());
+                let rendered_m = jiff::fmt::strtime::format("%Y-%m-%dT%H:%M:%S%:z", &zoned_m)
+                    .unwrap_or_else(|_| marker.timestamp.to_string());
+                let _ = write!(out, "  marker at {rendered_m}");
                 if let Some(label) = &marker.label {
                     let _ = write!(out, " ({label})");
                 }
@@ -208,7 +216,7 @@ mod tests {
         }];
         let plan = plan_with_one_keep_one_quarantine(markers);
 
-        let out = render_plan(&plan, false);
+        let out = render_plan(&plan, false, &jiff::tz::TimeZone::UTC);
 
         assert!(out.contains("[KEEP] kept"));
         assert!(!out.contains("QUARANTINE"));
@@ -225,13 +233,13 @@ mod tests {
         }];
         let plan = plan_with_one_keep_one_quarantine(markers);
 
-        let out = render_plan(&plan, true);
+        let out = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
 
         assert!(out.contains("[KEEP] kept"));
         assert!(out.contains("[QUARANTINE] unmarked"));
-        assert!(out.contains("marker at 1970-01-01T00:16:40Z"));
+        assert!(out.contains("marker at 1970-01-01T00:16:40+00:00"));
         assert!(
-            out.contains("recorded at: 1970-01-01T00:00:00Z"),
+            out.contains("recorded at: 1970-01-01T00:00:00+00:00"),
             "verbose mode should show the group's (GPS-corrected, when available) recorded time"
         );
         assert!(out.contains("Summary: 1 kept, 1 quarantined, 0 ignored (2 total)"));
@@ -240,7 +248,7 @@ mod tests {
     #[test]
     fn recorded_at_has_no_source_annotation_without_a_sidecar() {
         let plan = plan_with_one_keep_one_quarantine(vec![]);
-        let out = render_plan(&plan, true);
+        let out = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
         assert!(!out.contains("(source:"));
     }
 
@@ -248,7 +256,7 @@ mod tests {
     fn recorded_at_shows_time_source_from_sidecar() {
         let mut kept = group("kept", vec![]);
         kept.sidecar = Some(Sidecar {
-            filename: "markers.json".to_string(),
+            filename: "import.json".to_string(),
             content: serde_json::json!({"time_source": "gps"}),
         });
         let plan = ImportPlan {
@@ -260,9 +268,9 @@ mod tests {
             }],
         };
 
-        let out = render_plan(&plan, true);
+        let out = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
 
-        assert!(out.contains("recorded at: 1970-01-01T00:00:00Z (source: gps)"));
+        assert!(out.contains("recorded at: 1970-01-01T00:00:00+00:00 (source: gps)"));
     }
 
     #[test]
@@ -279,7 +287,7 @@ mod tests {
             }],
         };
 
-        let out_verbose = render_plan(&plan, true);
+        let out_verbose = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
         assert!(
             out_verbose.contains("[QUARANTINE] unmarked"),
             "verbose must show the quarantine entry"

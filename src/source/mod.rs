@@ -3,6 +3,7 @@
 //! device-specific logic itself.
 
 pub mod gopro;
+pub mod sidecar;
 pub mod tesla;
 
 use std::collections::HashMap;
@@ -11,8 +12,19 @@ use std::path::PathBuf;
 
 use globset::GlobSet;
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use crate::error::Result;
+
+/// Context passed to every `ImportSource::scan` call: the profile's
+/// ignore-glob set, the configured display/interpretation timezone, and
+/// the run-start timestamp (captured once per run so tests can pin it
+/// for deterministic sidecar output — design D5).
+pub struct ScanContext<'a> {
+    pub ignore: &'a GlobSet,
+    pub tz: &'a TimeZone,
+    pub imported_at: Timestamp,
+}
 
 /// A single file belonging to a `MediaGroup` (a clip, a sidecar, ...).
 #[derive(Debug, Clone, PartialEq)]
@@ -37,7 +49,7 @@ pub struct Marker {
 }
 
 /// A device-authored metadata file planned alongside a group's media
-/// (e.g. GoPro's `markers.json`, design D6). Attached during `scan` so
+/// (the unified `import.json`, design D6). Attached during `scan` so
 /// it is visible in the plan before anything is written; the transfer
 /// engine writes it, after the group's files transfer and verify.
 #[derive(Debug, Clone, PartialEq)]
@@ -81,12 +93,11 @@ pub trait ImportSource {
     fn detect(&self, root: &Path) -> bool;
 
     /// Discovers media under `root`, grouping files and assigning a
-    /// verdict to each group. `ignore` is the profile's common
-    /// ignore-glob set (design D2): a device applies it during
-    /// discovery so an ignored file is never opened, let alone parsed.
-    /// Must not modify anything under `root` (spec: "Scan produces a
-    /// reviewable plan without side effects").
-    fn scan(&self, root: &Path, ignore: &GlobSet) -> Result<Vec<(MediaGroup, Verdict)>>;
+    /// verdict to each group. `ctx` carries the profile's common
+    /// ignore-glob set, the configured timezone, and the run-start
+    /// timestamp (design D5). Must not modify anything under `root`
+    /// (spec: "Scan produces a reviewable plan without side effects").
+    fn scan(&self, root: &Path, ctx: &ScanContext) -> Result<Vec<(MediaGroup, Verdict)>>;
 }
 
 /// Placeholder `ImportSource`: never detects a card and never finds
@@ -101,7 +112,7 @@ impl ImportSource for GenericSource {
         false
     }
 
-    fn scan(&self, _root: &Path, _ignore: &GlobSet) -> Result<Vec<(MediaGroup, Verdict)>> {
+    fn scan(&self, _root: &Path, _ctx: &ScanContext) -> Result<Vec<(MediaGroup, Verdict)>> {
         Ok(Vec::new())
     }
 }

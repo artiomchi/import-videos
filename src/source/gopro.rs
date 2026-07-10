@@ -1,6 +1,6 @@
 //! GoPro HERO8 device module (roadmap changeset 2): card detection,
 //! chapter-file session grouping, HiLight-marker-driven keep/quarantine
-//! verdicts, and the `markers.json` sidecar. See
+//! verdicts, and the `import.json` sidecar. See
 //! `openspec/changes/add-gopro-import/design.md` for the decisions
 //! (D1-D8) this module implements.
 
@@ -9,12 +9,15 @@ use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use globset::GlobSet;
+use jiff::civil::DateTime as CivilDateTime;
+use jiff::tz::TimeZone;
 use jiff::{Span, Timestamp};
 use serde_json::json;
 
 use crate::error::Result;
 use crate::media::{gpmf, mp4};
-use crate::source::{ImportSource, Marker, MediaFile, MediaGroup, Sidecar, Verdict};
+use crate::source::sidecar::{self, EventEntry, SidecarEnvelope};
+use crate::source::{ImportSource, Marker, MediaFile, MediaGroup, ScanContext, Verdict};
 
 /// This changeset only claims HERO8 (design Non-Goals); the sidecar
 /// records it verbatim so a future multi-model changeset has a field
@@ -44,8 +47,8 @@ impl ImportSource for GoproSource {
         false
     }
 
-    fn scan(&self, root: &Path, ignore: &GlobSet) -> Result<Vec<(MediaGroup, Verdict)>> {
-        let (sessions, unrecognized) = discover(&root.join("DCIM"), ignore);
+    fn scan(&self, root: &Path, ctx: &ScanContext) -> Result<Vec<(MediaGroup, Verdict)>> {
+        let (sessions, unrecognized) = discover(&root.join("DCIM"), ctx.ignore);
 
         let mut groups = Vec::with_capacity(sessions.len() + 1);
         let mut session_ids: Vec<&String> = sessions.keys().collect();
@@ -54,7 +57,7 @@ impl ImportSource for GoproSource {
         for session_id in session_ids {
             let mut chapters = sessions[session_id].clone();
             chapters.sort_by_key(|(chapter, _)| *chapter);
-            groups.push(self.build_session(session_id, &chapters));
+            groups.push(self.build_session(session_id, &chapters, ctx));
         }
 
         if !unrecognized.is_empty() {
@@ -91,16 +94,27 @@ impl GoproSource {
         &self,
         session_id: &str,
         chapters: &[(u32, PathBuf)],
+        ctx: &ScanContext,
     ) -> (MediaGroup, Verdict) {
-        let chapter_times: Vec<Timestamp> = chapters
+        let chapter_civil_times: Vec<CivilDateTime> = chapters
             .iter()
-            .map(|(_, path)| chapter_timestamp(path))
+            .map(|(_, path)| chapter_civil_time(path))
             .collect();
 
         let mut telemetry: Vec<Option<ChapterTelemetry>> = chapters
             .iter()
             .map(|(_, path)| open_chapter_telemetry(path))
             .collect();
+
+        // Convert camera-clock civil times to instants. For GPS-corrected
+        // sessions the GPS path overrides these later; for camera-clock
+        // sessions these ARE the instants — interpreted in ctx.tz so the
+        // civil reading maps to the right instant (design D3).
+        let chapter_times: Vec<Timestamp> = chapter_civil_times
+            .iter()
+            .map(|&dt| civil_to_instant(dt, ctx.tz))
+            .collect();
+
         let session_offset = derive_session_offset(chapters, &chapter_times, &mut telemetry);
 
         let mut all_markers: Vec<MarkerHit> = Vec::new();
@@ -119,7 +133,6 @@ impl GoproSource {
                     None => (camera_wall_time, None),
                 };
                 all_markers.push(MarkerHit {
-                    file_name: file_name(path),
                     offset_ms,
                     wall_time,
                     coords,
@@ -133,12 +146,13 @@ impl GoproSource {
             Verdict::Quarantine
         };
 
-        // Session timestamp is the first chapter's camera-clock time,
-        // GPS-corrected when telemetry provided an offset (design D5,
-        // gopro-telemetry design D4).
+        // Session timestamp: GPS-corrected when telemetry provided an
+        // offset (already a real instant); otherwise the first chapter's
+        // camera-clock civil time interpreted in ctx.tz (design D3 /
+        // unify-timestamps D3).
         let session_timestamp = match &session_offset {
             Some(t) => chapter_times[0] + span_from_secs(t.offset_s),
-            None => chapter_times[0],
+            None => chapter_times[0], // already interpreted in ctx.tz above
         };
 
         let files: Vec<MediaFile> = chapters
@@ -168,8 +182,16 @@ impl GoproSource {
         let mut context = HashMap::new();
         context.insert("session".to_string(), session_id.to_string());
 
-        let sidecar = (verdict == Verdict::Keep)
-            .then(|| build_sidecar(session_id, chapters, &all_markers, &session_offset));
+        let sidecar = (verdict == Verdict::Keep).then(|| {
+            build_sidecar(
+                session_id,
+                chapters,
+                &all_markers,
+                &session_offset,
+                session_timestamp,
+                ctx,
+            )
+        });
 
         (
             MediaGroup {
@@ -190,7 +212,6 @@ impl GoproSource {
 /// (design D6) — richer than the core `Marker` type, which only needs
 /// a wall-clock timestamp.
 struct MarkerHit {
-    file_name: String,
     offset_ms: u32,
     /// Corrected (GPS) or camera-clock wall time, matching whichever
     /// `session_offset` produced it.
@@ -205,47 +226,53 @@ fn build_sidecar(
     chapters: &[(u32, PathBuf)],
     markers: &[MarkerHit],
     session_offset: &Option<SessionTelemetry>,
-) -> Sidecar {
+    session_timestamp: Timestamp,
+    ctx: &ScanContext,
+) -> super::Sidecar {
     let files: Vec<String> = chapters.iter().map(|(_, path)| file_name(path)).collect();
 
-    let markers: Vec<serde_json::Value> = markers
+    let events_json: Vec<EventEntry> = markers
         .iter()
-        .map(|hit| match session_offset {
-            Some(_) => {
-                let mut entry = json!({
-                    "file": hit.file_name,
-                    "offset_ms": hit.offset_ms,
-                    "utc": hit.wall_time.to_string(),
-                });
-                if let Some((lat, lon)) = hit.coords {
-                    entry["lat"] = json!(lat);
-                    entry["lon"] = json!(lon);
-                }
-                entry
-            }
-            None => json!({
-                "file": hit.file_name,
-                "offset_ms": hit.offset_ms,
-                "camera_time": hit.wall_time.to_string(),
-            }),
+        .map(|hit| EventEntry {
+            event_type: "gopro:marker".to_string(),
+            time: hit.wall_time,
+            lat: hit.coords.map(|(lat, _)| lat),
+            lon: hit.coords.map(|(_, lon)| lon),
+            reason: None,
+            offset_ms: Some(hit.offset_ms),
         })
         .collect();
 
-    let mut content = json!({
-        "camera": CAMERA_MODEL,
-        "session": session_id,
-        "files": files,
-        "time_source": if session_offset.is_some() { "gps" } else { "camera" },
-        "markers": markers,
-    });
+    let mut gopro_block = json!({ "session": session_id });
     if let Some(t) = session_offset {
-        content["clock_offset_s"] = json!(t.offset_s);
+        gopro_block["clock_offset_s"] = json!(t.offset_s);
     }
 
-    Sidecar {
-        filename: "markers.json".to_string(),
-        content,
-    }
+    let tz_name = ctx.tz.iana_name().unwrap_or("").to_string();
+    let source_dir = chapters
+        .first()
+        .and_then(|(_, p)| p.parent())
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
+
+    sidecar::build(
+        ctx.tz,
+        SidecarEnvelope {
+            camera: CAMERA_MODEL,
+            source: source_dir,
+            imported_at: ctx.imported_at,
+            timezone_name: tz_name,
+            recorded_at: session_timestamp,
+            time_source: if session_offset.is_some() {
+                "gps"
+            } else {
+                "camera"
+            },
+            files,
+        },
+        events_json,
+        Some(("gopro", gopro_block)),
+    )
 }
 
 /// The session-wide GPS correction (gopro-telemetry design D4/D7): a
@@ -517,22 +544,42 @@ fn file_name(path: &Path) -> String {
         .unwrap_or_default()
 }
 
-/// The camera-clock creation time for one chapter (design D5):
+/// Converts a camera-clock civil datetime to a real instant by
+/// interpreting it in the configured timezone (design D3 /
+/// unify-timestamps D3). Camera clocks record local time; without
+/// this step, a non-UTC zone would double-shift the wall reading.
+fn civil_to_instant(dt: CivilDateTime, tz: &TimeZone) -> Timestamp {
+    dt.to_zoned(tz.clone())
+        .map(|z| z.timestamp())
+        .unwrap_or_else(|_| dt.to_zoned(TimeZone::UTC).unwrap().timestamp())
+}
+
+/// The camera-clock civil creation time for one chapter (design D5):
 /// `moov/mvhd` if it can be read, else the file's modification time
-/// with a warning — a chapter that can't be timestamped precisely
-/// still gets imported rather than blocking the run.
-fn chapter_timestamp(path: &Path) -> Timestamp {
+/// converted back to a civil datetime using UTC (a best-effort
+/// fallback — the mtime is a real instant, not a wall clock, so we
+/// return it as a civil value at UTC). A chapter that can't be
+/// timestamped precisely still gets imported rather than blocking the
+/// run.
+fn chapter_civil_time(path: &Path) -> CivilDateTime {
     match File::open(path)
         .map_err(|e| e.to_string())
         .and_then(|mut f| mp4::read_creation_time(&mut f).map_err(|e| e.to_string()))
     {
-        Ok(timestamp) => timestamp,
+        // mp4::read_creation_time already returns a Timestamp; convert it to
+        // CivilDateTime in UTC as a best proxy for the camera's civil reading
+        // (the real MVHD value is a civil time, but the existing API returns
+        // it as a Timestamp — round-trip via UTC gives the same civil value
+        // the camera wrote).
+        Ok(timestamp) => timestamp.to_zoned(TimeZone::UTC).datetime(),
         Err(error) => {
             let fallback = fs::metadata(path)
                 .and_then(|m| m.modified())
                 .ok()
                 .and_then(|modified| Timestamp::try_from(modified).ok())
-                .unwrap_or(Timestamp::UNIX_EPOCH);
+                .unwrap_or(Timestamp::UNIX_EPOCH)
+                .to_zoned(TimeZone::UTC)
+                .datetime();
             tracing::warn!(
                 file = %path.display(),
                 %error,
@@ -566,6 +613,29 @@ fn chapter_markers(path: &Path) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::ScanContext;
+
+    /// A deterministic `ScanContext` for tests: UTC zone, epoch
+    /// imported_at, empty ignore set.
+    fn test_ctx_with_tz(tz: TimeZone) -> (globset::GlobSet, TimeZone, Timestamp) {
+        (
+            globset::GlobSetBuilder::new().build().unwrap(),
+            tz,
+            Timestamp::UNIX_EPOCH,
+        )
+    }
+
+    fn make_ctx<'a>(
+        ignore: &'a globset::GlobSet,
+        tz: &'a TimeZone,
+        imported_at: Timestamp,
+    ) -> ScanContext<'a> {
+        ScanContext {
+            ignore,
+            tz,
+            imported_at,
+        }
+    }
 
     #[test]
     fn parses_hero8_chapter_names() {
@@ -628,12 +698,19 @@ mod tests {
         let chapter = dir.path().join("GX010124.MP4");
         fs::write(&chapter, b"").unwrap();
 
-        let (group, verdict) = source.build_session("0124", &[(1, chapter)]);
+        let (ignore, tz, imported_at) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (group, verdict) = source.build_session("0124", &[(1, chapter)], &ctx);
         assert_eq!(verdict, Verdict::Keep);
         assert!(group.markers.is_empty());
         assert!(
             group.sidecar.is_some(),
-            "kept sessions carry a markers.json even with zero markers"
+            "kept sessions carry an import.json even with zero markers"
+        );
+        assert_eq!(
+            group.sidecar.unwrap().filename,
+            "import.json",
+            "sidecar must be named import.json, not markers.json"
         );
     }
 
@@ -932,7 +1009,9 @@ mod tests {
         let source = GoproSource {
             require_marker: true,
         };
-        let (group, verdict) = source.build_session("0001", &[(1, chapter)]);
+        let (ignore, tz, imported_at) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (group, verdict) = source.build_session("0001", &[(1, chapter)], &ctx);
 
         assert_eq!(verdict, Verdict::Keep);
         assert_eq!(
@@ -945,19 +1024,18 @@ mod tests {
 
         let sidecar = group.sidecar.unwrap();
         assert_eq!(sidecar.content["time_source"], "gps");
-        let offset = sidecar.content["clock_offset_s"].as_f64().unwrap();
+        let offset = sidecar.content["gopro"]["clock_offset_s"].as_f64().unwrap();
         assert!((offset - (-3612.0)).abs() < 0.01, "offset was {offset}");
 
-        let marker = &sidecar.content["markers"][0];
+        let marker = &sidecar.content["events"][0];
         assert!(marker.get("lat").is_some(), "marker should get coordinates");
-        assert_eq!(
-            marker["utc"]
-                .as_str()
-                .unwrap()
-                .parse::<Timestamp>()
-                .unwrap(),
-            "2026-07-09T23:19:48.5Z".parse::<Timestamp>().unwrap()
-        );
+        // The marker time is the corrected instant rendered in UTC at second precision.
+        let marker_time = marker["time"].as_str().unwrap();
+        let parsed: Timestamp = marker_time.parse().unwrap();
+        // corrected = camera_wall(00:20:00Z) + 500ms + offset(-3612s)
+        //           = 00:20:00.5Z - 3612s = 23:19:48.5Z → rounded to 23:19:48Z
+        let expected: Timestamp = "2026-07-09T23:19:48Z".parse().unwrap();
+        assert_eq!(parsed, expected, "marker time was {marker_time}");
     }
 
     #[test]
@@ -980,7 +1058,9 @@ mod tests {
         let source = GoproSource {
             require_marker: false,
         };
-        let (group, _) = source.build_session("0002", &[(1, chapter1), (2, chapter2)]);
+        let (ignore, tz, imported_at) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (group, _) = source.build_session("0002", &[(1, chapter1), (2, chapter2)], &ctx);
 
         // offset = GPSU(01:00:00) - (chapter2 mvhd 02:00:12 + 0s) = -3612s
         // session timestamp = chapter1 mvhd (00:20:00) + offset
@@ -1008,11 +1088,13 @@ mod tests {
         let source = GoproSource {
             require_marker: true,
         };
-        let (group, _) = source.build_session("0003", &[(1, chapter)]);
+        let (ignore, tz, imported_at) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (group, _) = source.build_session("0003", &[(1, chapter)], &ctx);
 
         let sidecar = group.sidecar.unwrap();
-        let marker = &sidecar.content["markers"][0];
-        assert!(marker.get("utc").is_some());
+        let marker = &sidecar.content["events"][0];
+        assert!(marker.get("time").is_some());
         assert!(
             marker.get("lat").is_none() && marker.get("lon").is_none(),
             "marker should have no coordinates: {marker:?}"
@@ -1037,28 +1119,33 @@ mod tests {
         let source = GoproSource {
             require_marker: true,
         };
+        let (ignore, tz, imported_at) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at);
 
-        let (gps_group, _) = source.build_session("0004", &[(1, gps_chapter)]);
+        let (gps_group, _) = source.build_session("0004", &[(1, gps_chapter)], &ctx);
         let gps_sidecar = gps_group.sidecar.unwrap();
         assert_eq!(gps_sidecar.content["time_source"], "gps");
-        assert!(gps_sidecar.content.get("clock_offset_s").is_some());
-        assert!(gps_sidecar.content["markers"][0].get("utc").is_some());
+        // clock_offset_s lives in the "gopro" device block.
+        assert!(gps_sidecar.content["gopro"].get("clock_offset_s").is_some());
+        // GPS events have "time" (not "utc" or "camera_time").
+        assert!(gps_sidecar.content["events"][0].get("time").is_some());
         assert!(
-            gps_sidecar.content["markers"][0]
+            gps_sidecar.content["events"][0]
                 .get("camera_time")
                 .is_none()
         );
 
-        let (camera_group, _) = source.build_session("0005", &[(1, camera_chapter)]);
+        let (camera_group, _) = source.build_session("0005", &[(1, camera_chapter)], &ctx);
         let camera_sidecar = camera_group.sidecar.unwrap();
         assert_eq!(camera_sidecar.content["time_source"], "camera");
-        assert!(camera_sidecar.content.get("clock_offset_s").is_none());
+        // No clock_offset_s for camera sessions.
         assert!(
-            camera_sidecar.content["markers"][0]
-                .get("camera_time")
-                .is_some()
+            camera_sidecar.content["gopro"]
+                .get("clock_offset_s")
+                .is_none()
         );
-        assert!(camera_sidecar.content["markers"][0].get("utc").is_none());
+        // Camera events also use "time" (unified field).
+        assert!(camera_sidecar.content["events"][0].get("time").is_some());
         assert!(camera_group.geo.is_none());
     }
 }

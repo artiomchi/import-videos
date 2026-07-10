@@ -50,7 +50,7 @@ profiles:
     type: tesla
     source: auto               # or an explicit path, e.g. /media/alice/TESLA
     destination: ~/Videos/tesla
-    layout: "{event_type}/{event_date}/{event_time}"
+    layout: "{event_type}/{date:%Y-%m-%d}/{date:%H-%M-%S}"
     events: [saved, sentry]     # tesla-specific: default shown; add `recent` to import RecentClips too
     reasons:
       deny: [sentry_aware_object_detection]   # or `allow: [...]` — not both
@@ -65,6 +65,7 @@ Common fields, available to every profile:
 | `source`        | `auto` (probe mount roots) or an explicit path                   |
 | `destination`   | Where kept footage lands                                         |
 | `layout`        | Path template under `destination`, resolved per media group      |
+| `timezone`      | IANA timezone name for `{date:...}` layout fields and mtime stamping (e.g. `Europe/Vilnius`); defaults to the system timezone |
 | `ignore`        | Glob patterns for files to skip entirely                         |
 | `quarantine`    | Where footage that doesn't meet the keep criteria goes           |
 | `delete_source` | Delete source files after a verified transfer (per-run: `--keep-source` overrides) |
@@ -90,28 +91,27 @@ not deleted. Set `require_marker: false` to keep every session regardless.
 Set `copy_quarantine: false` to leave unmarked sessions on the card entirely
 — they are still recognized and reported as `QUARANTINE` in `scan` output,
 but no copy is made and no quarantine folder is created.
-Kept sessions get a `markers.json` sidecar recording the camera model,
+Kept sessions get an `import.json` sidecar recording the camera model,
 session id, and chapter files. HERO8 chapters carry a GPMF telemetry track
 (`gpmd`) with GPS fixes and GPS-derived UTC; when it's present and usable
 (at least a 2D lock, DOP ≤ 5.0), the session's timestamp — and so its
 `{date:...}` destination folder — is the GPS-corrected UTC instant rather
 than the camera's clock, which drifts and (on GoPros) is local time
 mismarked as UTC. The sidecar then records `"time_source": "gps"`, the
-session's `clock_offset_s`, and each marker's corrected `utc` plus `lat`/
-`lon` (omitted for a marker with no nearby fix). Imported files' mtime is
+session's `clock_offset_s` in the `gopro` device block, and each marker's
+corrected timestamp plus `lat`/`lon` (omitted for a marker with no nearby
+fix) in the `events[]` array. Imported files' mtime is
 set to this corrected recording time after the verified copy completes —
 file content is untouched either way. Without usable telemetry (no `gpmd`
 track, no fix, or unparseable data), everything falls back to today's
 behavior: camera-clock timestamp, `"time_source": "camera"`, each marker's
-`camera_time`. A telemetry problem is logged and never fails or requeues an
-import — it only ever affects timestamps, never the Keep/Quarantine
-verdict.
+timestamp in the configured timezone. A telemetry problem is logged and
+never fails or requeues an import — it only ever affects timestamps, never
+the Keep/Quarantine verdict.
 
-Destination dates stay UTC-based even with GPS correction: a session that
-crosses midnight UTC lands in the UTC calendar date, which can read as the
-"wrong" local day for a late-evening ride. A `{date:local:...}` layout
-field to resolve against local time instead is a possible future addition,
-not something this changeset does.
+Destination dates are resolved in the configured `timezone` (default: system
+timezone). Set `timezone: UTC` in the config to get UTC-based folder names,
+or set it to your local IANA name (e.g. `Europe/Vilnius`) to get local dates.
 
 ### What gets kept — Tesla
 
@@ -132,22 +132,17 @@ filtered-out Tesla events are never quarantined — they get a visible
 since excluding them is a deliberate, reversible config choice, not
 uncertainty about whether the footage matters.
 
-Event timestamps are the vehicle's own local wall clock (see ADR 0006):
-destination folders reproduce that wall clock via the `event_type`,
-`event_date`, and `event_time` context fields (e.g.
-`{event_type}/{event_date}/{event_time}` → `saved/2026-07-04/18-23-51`,
-matching what the car's screen and the card's own folder names show),
-while each clip's `recorded_at`/mtime is resolved as a real instant in
-the importing machine's system timezone. If the vehicle and the
-importing machine are in different timezones, mtimes skew by the
-difference but folder names stay correct. A corrupt or missing
-`event.json` falls back to the event folder's own name for the
-timestamp; if neither is parseable, the event is `Ignore`d rather than
-imported with a guessed time. Each kept event gets a normalized
-`import.json` sidecar: device type, event type, source path, the parsed
-`event.json` fields, resolved wall-clock and UTC times with the
-timestamp's provenance (`event_json` or `folder_name`), and the file
-list.
+Event timestamps are the vehicle's own local wall clock: destination
+folders reproduce that wall clock via `{date:...}` layout fields rendered
+in the configured timezone (e.g. `{event_type}/{date:%Y-%m-%d}/{date:%H-%M-%S}`
+→ `saved/2026-07-04/18-23-51` when the vehicle's wall clock and the
+configured timezone agree). Set `timezone` in the config to match where the
+vehicle was driven; it defaults to the importing machine's system timezone.
+A corrupt or missing `event.json` falls back to the event folder's own name
+for the timestamp; if neither is parseable, the event is `Ignore`d rather
+than imported with a guessed time. Each kept event gets a unified
+`import.json` sidecar: common envelope (camera, source, times, files) +
+`events[]` array with the trigger reason + optional `tesla` device block.
 
 `layout` is a small template language: `{date:%Y}/{date:%Y-%m-%d}` resolves
 `{date...}` against the media group's timestamp via

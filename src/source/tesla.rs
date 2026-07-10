@@ -9,7 +9,6 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use globset::GlobSet;
 use jiff::Timestamp;
 use jiff::civil;
 use jiff::tz::TimeZone;
@@ -17,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::error::Result;
-use crate::source::{ImportSource, MediaFile, MediaGroup, Sidecar, Verdict};
+use crate::source::sidecar::{self, EventEntry, SidecarEnvelope};
+use crate::source::{ImportSource, MediaFile, MediaGroup, ScanContext, Verdict};
 
 /// Length of the `YYYY-MM-DD_HH-MM-SS` timestamp stem shared by event
 /// folder names and per-minute clip filenames.
@@ -94,7 +94,7 @@ impl ImportSource for TeslaSource {
             .any(|dir| teslacam.join(dir).is_dir())
     }
 
-    fn scan(&self, root: &Path, ignore: &GlobSet) -> Result<Vec<(MediaGroup, Verdict)>> {
+    fn scan(&self, root: &Path, ctx: &ScanContext) -> Result<Vec<(MediaGroup, Verdict)>> {
         let teslacam = root.join("TeslaCam");
         let mut groups = Vec::new();
         let mut stray_files: Vec<PathBuf> = Vec::new();
@@ -110,8 +110,8 @@ impl ImportSource for TeslaSource {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    groups.push(self.build_event_group(category, &path, ignore));
-                } else if path.is_file() && !ignore.is_match(&path) {
+                    groups.push(self.build_event_group(category, &path, ctx));
+                } else if path.is_file() && !ctx.ignore.is_match(&path) {
                     stray_files.push(path);
                 }
             }
@@ -120,7 +120,7 @@ impl ImportSource for TeslaSource {
         if let Ok(entries) = fs::read_dir(&teslacam) {
             for entry in entries.flatten() {
                 let path = entry.path();
-                if path.is_file() && !ignore.is_match(&path) {
+                if path.is_file() && !ctx.ignore.is_match(&path) {
                     stray_files.push(path);
                 }
             }
@@ -128,7 +128,7 @@ impl ImportSource for TeslaSource {
 
         if self.events.contains(&EventCategory::Recent) {
             let (recent_groups, recent_unrecognized) =
-                scan_recent_clips(&teslacam.join("RecentClips"), ignore);
+                scan_recent_clips(&teslacam.join("RecentClips"), ctx);
             groups.extend(recent_groups);
             stray_files.extend(recent_unrecognized);
         }
@@ -148,7 +148,7 @@ impl TeslaSource {
         &self,
         category: EventCategory,
         dir: &Path,
-        ignore: &GlobSet,
+        ctx: &ScanContext,
     ) -> (MediaGroup, Verdict) {
         let dir_name = file_name(dir);
         let parsed = parse_event_json(&dir.join("event.json"));
@@ -162,7 +162,7 @@ impl TeslaSource {
             return (
                 MediaGroup {
                     name: format!("{}-{}", category.as_str(), dir_name),
-                    files: collect_group_files(dir, ignore, Timestamp::UNIX_EPOCH),
+                    files: collect_group_files(dir, ctx.ignore, Timestamp::UNIX_EPOCH, ctx.tz),
                     timestamp: Timestamp::UNIX_EPOCH,
                     markers: Vec::new(),
                     geo: None,
@@ -173,9 +173,9 @@ impl TeslaSource {
             );
         };
 
-        let event_instant = resolve_instant(wall_clock);
-        let files = collect_group_files(dir, ignore, event_instant);
-        let context = build_context(category, wall_clock);
+        let event_instant = resolve_instant(wall_clock, ctx.tz);
+        let files = collect_group_files(dir, ctx.ignore, event_instant, ctx.tz);
+        let context = build_context(category);
 
         let verdict = if !self.events.contains(&category) {
             Verdict::Ignore(format!("event type '{}' not enabled", category.as_str()))
@@ -195,10 +195,10 @@ impl TeslaSource {
                 category,
                 dir,
                 Some(&parsed),
-                wall_clock,
                 event_instant,
                 time_source,
                 &files,
+                ctx,
             )
         });
 
@@ -286,38 +286,36 @@ fn parse_stem_prefix(file_name: &str) -> Option<civil::DateTime> {
 }
 
 /// Resolves a vehicle-local civil datetime to a real instant via the
-/// system timezone with jiff's default (compatible) DST disambiguation
-/// (design D3). Falls back to interpreting the civil time as UTC in
-/// the practically-never case that the system zone can't resolve it.
-fn resolve_instant(wall_clock: civil::DateTime) -> Timestamp {
+/// configured timezone with jiff's default (compatible) DST
+/// disambiguation (design D3 / unify-timestamps D1). Falls back to
+/// UTC in the practically-never case that the zone can't resolve it.
+fn resolve_instant(wall_clock: civil::DateTime, tz: &TimeZone) -> Timestamp {
     wall_clock
-        .to_zoned(TimeZone::system())
+        .to_zoned(tz.clone())
         .map(|z| z.timestamp())
         .unwrap_or_else(|_| wall_clock.to_zoned(TimeZone::UTC).unwrap().timestamp())
 }
 
-/// Layout-context fields formatted directly from the civil value —
-/// pure wall clock, immune to timezone/DST (design D3).
-fn build_context(category: EventCategory, wall_clock: civil::DateTime) -> HashMap<String, String> {
+/// Layout-context fields: only `event_type` remains (design D4 /
+/// unify-timestamps). Date and time are rendered through `{date:...}`
+/// in the configured zone, not via bespoke context keys.
+fn build_context(category: EventCategory) -> HashMap<String, String> {
     let mut context = HashMap::new();
     context.insert("event_type".to_string(), category.as_str().to_string());
-    context.insert(
-        "event_date".to_string(),
-        wall_clock.strftime("%Y-%m-%d").to_string(),
-    );
-    context.insert(
-        "event_time".to_string(),
-        wall_clock.strftime("%H-%M-%S").to_string(),
-    );
     context
 }
 
 /// Collects one event folder's files (non-recursive), applying the
 /// profile's `ignore` globs (design D2). Each clip's `recorded_at`
-/// comes from its own filename stem; files without a parseable stem
-/// (`event.json`, `thumb.png`, unrecognized files) use the event's own
-/// instant instead (design D8).
-fn collect_group_files(dir: &Path, ignore: &GlobSet, event_instant: Timestamp) -> Vec<MediaFile> {
+/// comes from its own filename stem interpreted in the configured
+/// timezone; files without a parseable stem (`event.json`, `thumb.png`,
+/// unrecognized files) use the event's own instant instead (design D8).
+fn collect_group_files(
+    dir: &Path,
+    ignore: &globset::GlobSet,
+    event_instant: Timestamp,
+    tz: &TimeZone,
+) -> Vec<MediaFile> {
     let Ok(entries) = fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -335,7 +333,7 @@ fn collect_group_files(dir: &Path, ignore: &GlobSet, event_instant: Timestamp) -
                 .file_name()
                 .and_then(|n| n.to_str())
                 .and_then(parse_stem_prefix)
-                .map(resolve_instant)
+                .map(|dt| resolve_instant(dt, tz))
                 .unwrap_or(event_instant);
             MediaFile {
                 size: fs::metadata(&path).map(|m| m.len()).unwrap_or(0),
@@ -351,7 +349,7 @@ fn collect_group_files(dir: &Path, ignore: &GlobSet, event_instant: Timestamp) -
 /// enabled (spec: "RecentClips import is opt-in"). Returns the
 /// per-minute Keep groups plus any file whose name doesn't carry a
 /// recognizable timestamp stem.
-fn scan_recent_clips(dir: &Path, ignore: &GlobSet) -> (Vec<(MediaGroup, Verdict)>, Vec<PathBuf>) {
+fn scan_recent_clips(dir: &Path, ctx: &ScanContext) -> (Vec<(MediaGroup, Verdict)>, Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {
         return (Vec::new(), Vec::new());
     };
@@ -360,7 +358,7 @@ fn scan_recent_clips(dir: &Path, ignore: &GlobSet) -> (Vec<(MediaGroup, Verdict)
     let mut unrecognized = Vec::new();
     for entry in entries.flatten() {
         let path = entry.path();
-        if !path.is_file() || ignore.is_match(&path) {
+        if !path.is_file() || ctx.ignore.is_match(&path) {
             continue;
         }
         let matched = path
@@ -382,7 +380,7 @@ fn scan_recent_clips(dir: &Path, ignore: &GlobSet) -> (Vec<(MediaGroup, Verdict)
         .map(|stem| {
             let wall_clock =
                 parse_stem_exact(stem).expect("cluster key was parsed from a valid stem");
-            let event_instant = resolve_instant(wall_clock);
+            let event_instant = resolve_instant(wall_clock, ctx.tz);
             let mut paths = clusters[stem].clone();
             paths.sort();
             let files: Vec<MediaFile> = paths
@@ -393,15 +391,15 @@ fn scan_recent_clips(dir: &Path, ignore: &GlobSet) -> (Vec<(MediaGroup, Verdict)
                     recorded_at: Some(event_instant),
                 })
                 .collect();
-            let context = build_context(EventCategory::Recent, wall_clock);
+            let context = build_context(EventCategory::Recent);
             let sidecar = build_sidecar(
                 EventCategory::Recent,
                 &dir.join(stem),
                 None,
-                wall_clock,
                 event_instant,
                 "folder_name",
                 &files,
+                ctx,
             );
             (
                 MediaGroup {
@@ -421,45 +419,55 @@ fn scan_recent_clips(dir: &Path, ignore: &GlobSet) -> (Vec<(MediaGroup, Verdict)
     (groups, unrecognized)
 }
 
-/// Assembles the `import.json` sidecar for a kept group (design D7):
-/// device type, event type, source folder path, parsed event metadata
-/// (when there is any — `RecentClips` clusters have none), resolved
-/// wall-clock and UTC times with timestamp provenance, and the file
-/// list.
+/// Assembles the unified `import.json` sidecar for a kept Tesla group
+/// (design D6 / unify-timestamps): common envelope + namespaced
+/// `events[]` entry (one trigger per event folder; none for
+/// RecentClips clusters) + optional `tesla` device block with `city`.
+/// The raw `event.json` still travels as a regular file and is NOT
+/// duplicated into the sidecar.
 fn build_sidecar(
     category: EventCategory,
     source_dir: &Path,
     parsed: Option<&ParsedEvent>,
-    wall_clock: civil::DateTime,
     recorded_at: Timestamp,
     time_source: &str,
     files: &[MediaFile],
-) -> Sidecar {
+    ctx: &ScanContext,
+) -> super::Sidecar {
     let file_names: Vec<String> = files.iter().map(|f| file_name(&f.path)).collect();
+    let tz_name = ctx.tz.iana_name().unwrap_or("").to_string();
 
-    let event = parsed.map(|p| {
-        json!({
-            "timestamp": p.timestamp.map(|t| t.to_string()),
-            "city": p.city,
-            "lat": p.geo.map(|(lat, _)| lat),
-            "lon": p.geo.map(|(_, lon)| lon),
-            "reason": p.reason,
+    let events: Vec<EventEntry> = parsed
+        .map(|p| {
+            vec![EventEntry {
+                event_type: format!("tesla:{}", category.as_str()),
+                time: recorded_at,
+                lat: p.geo.map(|(lat, _)| lat),
+                lon: p.geo.map(|(_, lon)| lon),
+                reason: p.reason.clone(),
+                offset_ms: None,
+            }]
         })
-    });
+        .unwrap_or_default();
 
-    Sidecar {
-        filename: "import.json".to_string(),
-        content: json!({
-            "camera": "tesla",
-            "event_type": category.as_str(),
-            "source": source_dir.display().to_string(),
-            "event": event,
-            "time_source": time_source,
-            "wall_clock": wall_clock.to_string(),
-            "recorded_at": recorded_at.to_string(),
-            "files": file_names,
-        }),
-    }
+    let device_block = parsed
+        .and_then(|p| p.city.as_deref())
+        .map(|city| ("tesla", json!({ "city": city })));
+
+    sidecar::build(
+        ctx.tz,
+        SidecarEnvelope {
+            camera: "tesla",
+            source: source_dir.display().to_string(),
+            imported_at: ctx.imported_at,
+            timezone_name: tz_name,
+            recorded_at,
+            time_source,
+            files: file_names,
+        },
+        events,
+        device_block,
+    )
 }
 
 /// One `Ignore("unrecognized file(s)")` group for stray files found
@@ -496,6 +504,7 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::source::ScanContext;
 
     fn write(path: &Path, contents: &str) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -510,6 +519,28 @@ mod tests {
 
     fn source(events: Vec<EventCategory>, reasons: Option<Reasons>) -> TeslaSource {
         TeslaSource { events, reasons }
+    }
+
+    /// A deterministic `ScanContext` for tests: UTC zone, epoch
+    /// `imported_at`, empty ignore set.
+    fn test_ctx_parts() -> (globset::GlobSet, TimeZone, Timestamp) {
+        (
+            globset::GlobSetBuilder::new().build().unwrap(),
+            TimeZone::UTC,
+            Timestamp::UNIX_EPOCH,
+        )
+    }
+
+    fn make_ctx<'a>(
+        ignore: &'a globset::GlobSet,
+        tz: &'a TimeZone,
+        imported_at: Timestamp,
+    ) -> ScanContext<'a> {
+        ScanContext {
+            ignore,
+            tz,
+            imported_at,
+        }
     }
 
     #[test]
@@ -551,17 +582,21 @@ mod tests {
         write(&event_dir.join("2026-07-04_18-18-32-front.mp4"), "front");
         write(&event_dir.join("2026-07-04_18-18-32-back.mp4"), "back");
 
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let (group, verdict) = source(default_events(), None).build_event_group(
             EventCategory::Saved,
             &event_dir,
-            &GlobSet::empty(),
+            &ctx,
         );
 
         assert_eq!(verdict, Verdict::Keep);
         assert_eq!(group.files.len(), 4);
         assert_eq!(group.context["event_type"], "saved");
-        assert_eq!(group.context["event_date"], "2026-07-04");
-        assert_eq!(group.context["event_time"], "18-23-51");
+        // event_date and event_time context fields are removed; date/time
+        // renders through {date:...} in the configured zone now.
+        assert!(!group.context.contains_key("event_date"));
+        assert!(!group.context.contains_key("event_time"));
     }
 
     #[test]
@@ -573,10 +608,12 @@ mod tests {
             &event_json("sentry_aware_object_detection"),
         );
 
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let (_, verdict) = source(vec![EventCategory::Saved], None).build_event_group(
             EventCategory::Sentry,
             &event_dir,
-            &GlobSet::empty(),
+            &ctx,
         );
         assert_eq!(
             verdict,
@@ -594,10 +631,12 @@ mod tests {
         );
 
         let reasons = Reasons::Deny(vec!["sentry_aware_object_detection".to_string()]);
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let (_, verdict) = source(default_events(), Some(reasons)).build_event_group(
             EventCategory::Sentry,
             &event_dir,
-            &GlobSet::empty(),
+            &ctx,
         );
         assert_eq!(
             verdict,
@@ -615,10 +654,12 @@ mod tests {
         );
 
         let reasons = Reasons::Allow(vec!["user_interaction_honk".to_string()]);
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let (_, verdict) = source(default_events(), Some(reasons)).build_event_group(
             EventCategory::Sentry,
             &event_dir,
-            &GlobSet::empty(),
+            &ctx,
         );
         assert!(matches!(verdict, Verdict::Ignore(_)));
     }
@@ -633,10 +674,12 @@ mod tests {
         );
 
         let reasons = Reasons::Allow(vec!["user_interaction_honk".to_string()]);
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let (_, verdict) = source(default_events(), Some(reasons)).build_event_group(
             EventCategory::Saved,
             &event_dir,
-            &GlobSet::empty(),
+            &ctx,
         );
         assert_eq!(verdict, Verdict::Keep);
     }
@@ -647,13 +690,16 @@ mod tests {
         let event_dir = dir.path().join("TeslaCam/SavedClips/2026-07-04_18-23-51");
         write(&event_dir.join("event.json"), "{not valid json");
 
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let (group, verdict) = source(default_events(), None).build_event_group(
             EventCategory::Saved,
             &event_dir,
-            &GlobSet::empty(),
+            &ctx,
         );
         assert_eq!(verdict, Verdict::Keep);
-        assert_eq!(group.context["event_date"], "2026-07-04");
+        // event_date context field removed; date renders through {date:...}
+        assert!(!group.context.contains_key("event_date"));
         let sidecar = group.sidecar.unwrap();
         assert_eq!(sidecar.content["time_source"], "folder_name");
     }
@@ -664,10 +710,12 @@ mod tests {
         let event_dir = dir.path().join("TeslaCam/SavedClips/not-a-timestamp");
         write(&event_dir.join("event.json"), "{not valid json");
 
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let (_, verdict) = source(default_events(), None).build_event_group(
             EventCategory::Saved,
             &event_dir,
-            &GlobSet::empty(),
+            &ctx,
         );
         assert_eq!(
             verdict,
@@ -684,10 +732,12 @@ mod tests {
             &event_json("user_interaction_honk"),
         );
 
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let (group, _) = source(default_events(), None).build_event_group(
             EventCategory::Saved,
             &event_dir,
-            &GlobSet::empty(),
+            &ctx,
         );
         let (lat, lon) = group.geo.unwrap();
         assert!((lat - 51.5012).abs() < 1e-9);
@@ -700,8 +750,10 @@ mod tests {
         let recent = dir.path().join("TeslaCam/RecentClips");
         write(&recent.join("2026-07-04_18-40-00-front.mp4"), "front");
 
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let groups = source(default_events(), None)
-            .scan(dir.path(), &GlobSet::empty())
+            .scan(dir.path(), &ctx)
             .unwrap();
         assert!(groups.is_empty());
     }
@@ -723,9 +775,9 @@ mod tests {
 
         let mut events = default_events();
         events.push(EventCategory::Recent);
-        let groups = source(events, None)
-            .scan(dir.path(), &GlobSet::empty())
-            .unwrap();
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let groups = source(events, None).scan(dir.path(), &ctx).unwrap();
 
         assert_eq!(groups.len(), 2);
         for (group, verdict) in &groups {
@@ -740,8 +792,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join("TeslaCam/SavedClips/stray.mp4"), "stray");
 
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let groups = source(default_events(), None)
-            .scan(dir.path(), &GlobSet::empty())
+            .scan(dir.path(), &ctx)
             .unwrap();
         assert_eq!(groups.len(), 1);
         let (group, verdict) = &groups[0];
@@ -762,10 +816,12 @@ mod tests {
         );
         write(&event_dir.join("notes.txt"), "notes");
 
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let (group, verdict) = source(default_events(), None).build_event_group(
             EventCategory::Saved,
             &event_dir,
-            &GlobSet::empty(),
+            &ctx,
         );
         assert_eq!(verdict, Verdict::Keep);
         assert!(
@@ -804,8 +860,10 @@ mod tests {
         write(&dir.path().join("TeslaCam/SavedClips/stray.mp4"), "stray");
 
         let reasons = Reasons::Deny(vec!["sentry_aware_object_detection".to_string()]);
+        let (ignore, tz, imported_at) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at);
         let groups = source(vec![EventCategory::Saved], Some(reasons))
-            .scan(dir.path(), &GlobSet::empty())
+            .scan(dir.path(), &ctx)
             .unwrap();
 
         assert!(!groups.is_empty());

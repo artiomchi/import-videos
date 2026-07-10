@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 
 use jiff::Timestamp;
+use jiff::tz::TimeZone;
 
 use crate::error::{Error, Result};
 
@@ -100,12 +101,15 @@ impl LayoutTemplate {
     }
 
     /// Resolves the template against a group's context map and
-    /// timestamp. `{date...}` formats `timestamp` via jiff; every other
-    /// field is looked up by name in `context`.
+    /// timestamp. `{date...}` formats `timestamp` in `tz` via jiff's
+    /// strftime — the zone is applied here so late-evening instants
+    /// land on the local calendar day (design D4). Every other field
+    /// is looked up by name in `context`.
     pub fn resolve(
         &self,
         context: &HashMap<String, String>,
         timestamp: Timestamp,
+        tz: &TimeZone,
     ) -> Result<String> {
         let mut out = String::new();
         for token in &self.tokens {
@@ -113,7 +117,8 @@ impl LayoutTemplate {
                 Token::Literal(s) => out.push_str(s),
                 Token::Field { name, strftime } if name == DATE_FIELD => {
                     let fmt = strftime.as_deref().unwrap_or(DEFAULT_DATE_FORMAT);
-                    let formatted = jiff::fmt::strtime::format(fmt, timestamp)
+                    let zoned = timestamp.to_zoned(tz.clone());
+                    let formatted = jiff::fmt::strtime::format(fmt, &zoned)
                         .expect("strftime spec validated at parse time");
                     out.push_str(&formatted);
                 }
@@ -133,11 +138,19 @@ impl LayoutTemplate {
 mod tests {
     use super::*;
 
+    fn utc() -> TimeZone {
+        TimeZone::UTC
+    }
+
+    fn vilnius() -> TimeZone {
+        TimeZone::get("Europe/Vilnius").unwrap()
+    }
+
     #[test]
     fn parses_literal_and_date_tokens() {
         let template = LayoutTemplate::parse("{date:%Y}/{date:%Y-%m-%d}").unwrap();
         let resolved = template
-            .resolve(&HashMap::new(), Timestamp::from_second(0).unwrap())
+            .resolve(&HashMap::new(), Timestamp::from_second(0).unwrap(), &utc())
             .unwrap();
         assert_eq!(resolved, "1970/1970-01-01");
     }
@@ -146,7 +159,7 @@ mod tests {
     fn bare_date_field_uses_default_format() {
         let template = LayoutTemplate::parse("{date}").unwrap();
         let resolved = template
-            .resolve(&HashMap::new(), Timestamp::from_second(0).unwrap())
+            .resolve(&HashMap::new(), Timestamp::from_second(0).unwrap(), &utc())
             .unwrap();
         assert_eq!(resolved, "1970-01-01");
     }
@@ -157,7 +170,7 @@ mod tests {
         let mut context = HashMap::new();
         context.insert("event_type".to_string(), "sentry".to_string());
         let resolved = template
-            .resolve(&context, Timestamp::from_second(0).unwrap())
+            .resolve(&context, Timestamp::from_second(0).unwrap(), &utc())
             .unwrap();
         assert_eq!(resolved, "sentry/clip");
     }
@@ -166,7 +179,7 @@ mod tests {
     fn unknown_field_fails_at_resolution() {
         let template = LayoutTemplate::parse("{missing}").unwrap();
         let err = template
-            .resolve(&HashMap::new(), Timestamp::from_second(0).unwrap())
+            .resolve(&HashMap::new(), Timestamp::from_second(0).unwrap(), &utc())
             .unwrap_err();
         assert!(err.to_string().contains("missing"));
     }
@@ -196,5 +209,27 @@ mod tests {
         // instead squashed to a literal rather than rejected).
         let err = LayoutTemplate::parse("{date:%-}").unwrap_err();
         assert!(err.to_string().contains("invalid strftime"));
+    }
+
+    #[test]
+    fn date_renders_in_configured_zone() {
+        // Spec scenario: "Layout date renders in the configured zone"
+        // 2026-07-04T15:23:51Z in Europe/Vilnius (+03:00) → 18:23:51.
+        let ts = Timestamp::from_second(1783178631).unwrap(); // 2026-07-04T15:23:51Z
+        let template = LayoutTemplate::parse("{date:%Y-%m-%d}/{date:%H-%M-%S}").unwrap();
+        let resolved = template.resolve(&HashMap::new(), ts, &vilnius()).unwrap();
+        assert_eq!(resolved, "2026-07-04/18-23-51");
+    }
+
+    #[test]
+    fn evening_instant_lands_on_local_calendar_day() {
+        // Spec scenario: "Evening ride keeps its local calendar day"
+        // 2026-07-04T22:30:00Z in America/Los_Angeles (-07:00) → 2026-07-04
+        // (not 2026-07-05 which is what UTC would give).
+        let ts = Timestamp::from_second(1783204200).unwrap(); // 2026-07-04T22:30:00Z
+        let la = TimeZone::get("America/Los_Angeles").unwrap();
+        let template = LayoutTemplate::parse("{date:%Y-%m-%d}").unwrap();
+        let resolved = template.resolve(&HashMap::new(), ts, &la).unwrap();
+        assert_eq!(resolved, "2026-07-04");
     }
 }

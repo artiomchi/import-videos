@@ -81,16 +81,20 @@ Scanning SHALL parse each event's `event.json` for `timestamp`, `city`, `est_lat
 - **WHEN** an event folder has an unparseable name and no usable `event.json` timestamp
 - **THEN** the event receives an Ignore verdict with a reason and is not imported
 
-### Requirement: Wall-clock naming with system-timezone instants
-Event timestamps SHALL be treated as vehicle-local civil datetimes. Each event group SHALL expose layout-context fields `event_type` (`saved`, `sentry`, or `recent`), `event_date` (`YYYY-MM-DD`), and `event_time` (`HH-MM-SS`) formatted directly from the civil value, so destination paths reproduce the vehicle's wall clock regardless of timezone or DST. The group timestamp and per-file recorded-at instants SHALL be produced by resolving civil times in the system timezone. Each clip's recorded-at SHALL come from its own filename stem; `event.json` and `thumb.png` SHALL use the event timestamp.
+### Requirement: Tesla timestamps in the configured timezone
+Tesla event timestamps SHALL be treated as vehicle civil datetimes interpreted in the configured `timezone` to produce the group timestamp and per-file recorded-at instants. Each event group SHALL expose `event_type` (`saved`, `sentry`, or `recent`) as its only layout-context field; date and time components SHALL be rendered through `{date:...}`, not through dedicated context fields. Each clip's recorded-at SHALL come from its own filename stem interpreted in the configured `timezone`; `event.json` and `thumb.png` SHALL use the event timestamp.
 
-#### Scenario: Layout reproduces the vehicle wall clock
-- **WHEN** an event with civil timestamp `2026-07-04T18:23:51` is imported with layout `{event_type}/{event_date}/{event_time}`
-- **THEN** the destination directory is `saved/2026-07-04/18-23-51` independent of the importing machine's timezone
+#### Scenario: event_type is available to the layout
+- **WHEN** a saved event is imported with layout `{event_type}/{date:%Y-%m-%d}/{date:%H-%M-%S}`
+- **THEN** the resolved destination begins with `saved/`
 
-#### Scenario: Clip mtimes reflect their own start minute
+#### Scenario: Layout date reproduces the vehicle clock via the configured zone
+- **WHEN** an event with civil timestamp `2026-07-04T18:23:51` is imported with `timezone` set to the vehicle's zone and layout `{event_type}/{date:%Y-%m-%d}/{date:%H-%M-%S}`
+- **THEN** the destination directory is `saved/2026-07-04/18-23-51`
+
+#### Scenario: Clip mtimes reflect their own start minute in the configured zone
 - **WHEN** an event contains clips with stems `2026-07-04_18-18-32` and `2026-07-04_18-19-32`
-- **THEN** each imported clip's modification time corresponds to its own stem resolved in the system timezone
+- **THEN** each imported clip's modification time corresponds to its own stem interpreted in the configured `timezone`
 
 ### Requirement: RecentClips import is opt-in
 Scanning SHALL skip `TeslaCam/RecentClips/` unless the profile's `events` list includes `recent`. When enabled, files in `RecentClips/` sharing a filename-stem timestamp (`YYYY-MM-DD_HH-MM-SS`) SHALL form one group per stem with `event_type` `recent`, wall-clock context derived from the stem, and no reason filtering applied.
@@ -104,15 +108,19 @@ Scanning SHALL skip `TeslaCam/RecentClips/` unless the profile's `events` list i
 - **THEN** the scan produces two Keep groups of four files each
 
 ### Requirement: Normalized import sidecar
-Each kept event group SHALL carry a sidecar named `import.json` written into the event's destination directory after all its files transfer and verify. The sidecar SHALL record the device type, `event_type`, source folder path, the parsed event metadata (recorded timestamp, city, coordinates, reason where present), the resolved wall-clock and UTC times with the timestamp's provenance (`event.json` or folder name), and the list of imported files. The sidecar SHALL NOT be named `event.json`, which is imported verbatim as an event file.
+Each kept event group SHALL carry the unified `import.json` sidecar (see the `unified-sidecar` capability), written into the event's destination directory after all its files transfer and verify. For Tesla the sidecar SHALL set `camera` to the device identifier, `source` to the event folder path, `recorded_at` to the resolved event instant, and `time_source` to the timestamp's provenance (`event_json` when the time came from `event.json`, or `folder_name` when it fell back to the event folder name). The event's trigger SHALL appear as a single `events` entry with a namespaced `type` (`tesla:saved`, `tesla:sentry`, or `tesla:recent`), its `time`, its `reason` where known, and `lat`/`lon` where known. The event's `city`, when present, SHALL be the only member of the `tesla` device block. The sidecar SHALL NOT be named `event.json`, which is imported verbatim as an event file and is not duplicated into the sidecar.
 
 #### Scenario: Sidecar written alongside imported event
 - **WHEN** a saved event with a valid `event.json` is imported
-- **THEN** the destination folder contains the original `event.json` plus an `import.json` recording event type, source path, reason, coordinates, and the file list
+- **THEN** the destination folder contains the original `event.json` plus an `import.json` whose envelope names the source path and whose `events` entry has `type` `tesla:saved` with the trigger reason and coordinates
 
 #### Scenario: Sidecar records timestamp provenance
 - **WHEN** an event's timestamp came from its folder name because `event.json` was unreadable
-- **THEN** `import.json` records that the timestamp's source was the folder name
+- **THEN** `import.json` records `time_source` as `folder_name`
+
+#### Scenario: City is the only Tesla-block field
+- **WHEN** an event whose `event.json` has `city: Vilnius` is imported
+- **THEN** `import.json`'s `tesla` block is `{ "city": "Vilnius" }` and the coordinates, reason, and timestamp appear only in the envelope or the `events` entry
 
 ### Requirement: Tesla verdicts never quarantine
 The Tesla implementation SHALL assign only `Keep` or `Ignore` verdicts. It SHALL NOT assign `Quarantine`: an excluded Tesla event is a deliberate, reversible configuration choice and its footage remains on the card.
