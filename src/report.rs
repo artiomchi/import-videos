@@ -131,6 +131,12 @@ pub fn render_results(report: &ExecuteReport) -> String {
                 TransferOutcome::SkippedIdentical => {
                     format!("skipped (already imported): {}", file.src.display())
                 }
+                TransferOutcome::SkippedQuickMatch => {
+                    format!(
+                        "skipped (quick-matched, not verified): {}",
+                        file.src.display()
+                    )
+                }
                 TransferOutcome::Suffixed(dest) => format!(
                     "stored as {} (destination name collision): {}",
                     dest.display(),

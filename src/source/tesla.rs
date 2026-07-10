@@ -446,6 +446,7 @@ fn build_sidecar(
                 lon: p.geo.map(|(_, lon)| lon),
                 reason: p.reason.clone(),
                 offset_ms: None,
+                file: None,
             }]
         })
         .unwrap_or_default();

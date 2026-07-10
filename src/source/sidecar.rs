@@ -23,6 +23,18 @@ fn format_ts(ts: Timestamp, tz: &TimeZone) -> String {
         .expect("SIDECAR_TIMESTAMP_FORMAT is a constant, always valid")
 }
 
+/// Renders a millisecond offset as `M:SS.mmm` — whole minutes with no
+/// leading zero, two-digit seconds, three-digit milliseconds. No hour
+/// component: minutes roll over 60 (e.g. 734120 ms → `"12:14.120"`).
+/// Design D5.
+pub fn format_offset(ms: u32) -> String {
+    let total_secs = ms / 1000;
+    let millis = ms % 1000;
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    format!("{mins}:{secs:02}.{millis:03}")
+}
+
 /// One entry in `events[]`. The `type` field uses namespaced form,
 /// e.g. `gopro:marker` or `tesla:saved`.
 pub struct EventEntry {
@@ -35,6 +47,11 @@ pub struct EventEntry {
     pub reason: Option<String>,
     /// Millisecond offset from session start (GoPro markers only).
     pub offset_ms: Option<u32>,
+    /// Base name of the source file this event came from (GoPro markers
+    /// only — each marker belongs to one chapter). `None` when a single
+    /// source file cannot be attributed (e.g. Tesla events whose clips
+    /// are synchronised around one trigger).
+    pub file: Option<String>,
 }
 
 /// Inputs that every device provides to build the common envelope.
@@ -85,6 +102,10 @@ pub fn build(
             }
             if let Some(offset_ms) = e.offset_ms {
                 entry["offset_ms"] = json!(offset_ms);
+                entry["offset"] = json!(format_offset(offset_ms));
+            }
+            if let Some(file) = e.file {
+                entry["file"] = json!(file);
             }
             entry
         })
@@ -196,5 +217,32 @@ mod tests {
         let ts = fixed_ts(0);
         let sidecar = build(&TimeZone::UTC, envelope("UTC", ts, ts), vec![], None);
         assert_eq!(sidecar.filename, "import.json");
+    }
+
+    // format_offset boundary tests (design D5, task 1.3).
+    #[test]
+    fn format_offset_zero() {
+        assert_eq!(format_offset(0), "0:00.000");
+    }
+
+    #[test]
+    fn format_offset_sub_minute() {
+        assert_eq!(format_offset(5000), "0:05.000");
+    }
+
+    #[test]
+    fn format_offset_exactly_one_minute() {
+        assert_eq!(format_offset(60000), "1:00.000");
+    }
+
+    #[test]
+    fn format_offset_multi_minute() {
+        assert_eq!(format_offset(734120), "12:14.120");
+    }
+
+    #[test]
+    fn format_offset_over_sixty_minutes_no_hour() {
+        // 4 200 000 ms = 70 minutes exactly; must not roll into hours.
+        assert_eq!(format_offset(4_200_000), "70:00.000");
     }
 }

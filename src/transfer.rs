@@ -29,6 +29,12 @@ pub enum TransferOutcome {
     /// this outcome MUST NOT count as a success and MUST NOT make the
     /// group a source-deletion candidate.
     SkippedQuarantineDisabled,
+    /// The destination file's name, size, and mtime matched the source
+    /// within the 0.1 s tolerance — accepted as already-imported
+    /// without content hashing. Because the content was **not** verified,
+    /// this outcome MUST NOT make the group a source-deletion candidate
+    /// (design D1, D2, ADR 0009).
+    SkippedQuickMatch,
     Failed(String),
 }
 
@@ -56,14 +62,30 @@ pub struct ExecuteReport {
     pub deletion_skipped_reason: Option<String>,
 }
 
-fn outcome_is_success(outcome: &TransferOutcome) -> bool {
+/// Gates sidecar-writing and "handled" reporting: the file is in
+/// place at the destination, whether by full verified transfer,
+/// identity skip, suffix rename, or quick-match heuristic.
+/// `SkippedQuarantineDisabled` is excluded (no copy was made).
+fn in_place_at_destination(outcome: &TransferOutcome) -> bool {
     matches!(
         outcome,
         TransferOutcome::Transferred
             | TransferOutcome::SkippedIdentical
-            | TransferOutcome::Suffixed(_) // SkippedQuarantineDisabled is intentionally excluded: a file
-                                           // left in place is never a verified transfer, so its group
-                                           // must never become a source-deletion candidate.
+            | TransferOutcome::Suffixed(_)
+            | TransferOutcome::SkippedQuickMatch
+    )
+}
+
+/// Gates source deletion: the file’s content was actually verified at
+/// the destination. Excludes `SkippedQuickMatch` (heuristic only —
+/// unverified) and `SkippedQuarantineDisabled` (no copy at all).
+/// Design D1; preserves ADR 0003’s safety invariant.
+fn content_verified(outcome: &TransferOutcome) -> bool {
+    matches!(
+        outcome,
+        TransferOutcome::Transferred
+            | TransferOutcome::SkippedIdentical
+            | TransferOutcome::Suffixed(_)
     )
 }
 
@@ -86,6 +108,7 @@ pub fn execute(
     delete_source: bool,
     keep_source: bool,
     assume_yes: bool,
+    quick_match: bool,
 ) -> Result<ExecuteReport> {
     // The one place we consult the ambient terminal: whether stdin is
     // interactive is what decides if a missing `--yes` prompts or
@@ -98,6 +121,7 @@ pub fn execute(
         delete_source,
         keep_source,
         assume_yes,
+        quick_match,
         io::stdin().is_terminal(),
     )
 }
@@ -107,6 +131,7 @@ fn execute_inner(
     delete_source: bool,
     keep_source: bool,
     assume_yes: bool,
+    quick_match: bool,
     stdin_is_terminal: bool,
 ) -> Result<ExecuteReport> {
     let mut groups = Vec::with_capacity(plan.actions.len());
@@ -121,7 +146,8 @@ fn execute_inner(
         let mut files = Vec::with_capacity(action.group.files.len());
         if let Some(dir) = target_dir {
             for media_file in &action.group.files {
-                let outcome = transfer_file(&media_file.path, dir, media_file.recorded_at)?;
+                let outcome =
+                    transfer_file(&media_file.path, dir, media_file.recorded_at, quick_match)?;
                 files.push(FileResult {
                     src: media_file.path.clone(),
                     outcome,
@@ -142,7 +168,7 @@ fn execute_inner(
         // transferred and verified (spec: "written ... only after all
         // of the session's files transferred and verified").
         let all_files_ok =
-            !files.is_empty() && files.iter().all(|f| outcome_is_success(&f.outcome));
+            !files.is_empty() && files.iter().all(|f| in_place_at_destination(&f.outcome));
         let sidecar_outcome = match (target_dir, &action.group.sidecar) {
             (Some(dir), Some(sidecar)) if all_files_ok => Some(write_sidecar(dir, sidecar)),
             _ => None,
@@ -161,7 +187,7 @@ fn execute_inner(
     if delete_source && !keep_source {
         let any_eligible = groups.iter().any(|g| {
             !g.files.is_empty()
-                && g.files.iter().all(|f| outcome_is_success(&f.outcome))
+                && g.files.iter().all(|f| content_verified(&f.outcome))
                 && sidecar_ok(&g.sidecar_outcome)
         });
 
@@ -170,7 +196,7 @@ fn execute_inner(
                 Confirmation::Confirmed => {
                     for group in &mut groups {
                         let all_ok = !group.files.is_empty()
-                            && group.files.iter().all(|f| outcome_is_success(&f.outcome))
+                            && group.files.iter().all(|f| content_verified(&f.outcome))
                             && sidecar_ok(&group.sidecar_outcome);
                         if all_ok {
                             for file in &group.files {
@@ -268,14 +294,18 @@ fn write_sidecar_inner(dir: &Path, sidecar: &Sidecar) -> Result<()> {
 /// `recorded_at`, when given, stamps the destination's mtime after the
 /// verified rename (gopro-telemetry design D8) — never for a file
 /// that's skipped as already-imported.
+/// When `quick_match` is `true` and `recorded_at` is `Some`, the fast
+/// path in `transfer_inner` may return `SkippedQuickMatch` without
+/// hashing; see design D3.
 pub fn transfer_file(
     src: &Path,
     dest_dir: &Path,
     recorded_at: Option<Timestamp>,
+    quick_match: bool,
 ) -> Result<TransferOutcome> {
     fs::create_dir_all(dest_dir).map_err(|e| Error::io(dest_dir, e))?;
 
-    match transfer_inner(src, dest_dir, recorded_at) {
+    match transfer_inner(src, dest_dir, recorded_at, quick_match) {
         Ok(outcome) => Ok(outcome),
         Err(e) => Ok(TransferOutcome::Failed(e.to_string())),
     }
@@ -285,6 +315,7 @@ fn transfer_inner(
     src: &Path,
     dest_dir: &Path,
     recorded_at: Option<Timestamp>,
+    quick_match: bool,
 ) -> Result<TransferOutcome> {
     let file_name = src.file_name().ok_or_else(|| {
         Error::io(
@@ -292,6 +323,27 @@ fn transfer_inner(
             io::Error::new(io::ErrorKind::InvalidInput, "source path has no file name"),
         )
     })?;
+
+    // Quick-match fast path (design D3, ADR 0009): before hashing,
+    // check if the canonical destination file already exists with
+    // matching size and mtime within 0.1 s of `recorded_at`.
+    // On any miss — file absent, size differs, mtime outside tolerance,
+    // or any I/O error — fall through to the full verified path.
+    if quick_match && let Some(ref_ts) = recorded_at {
+        let dest_candidate = dest_dir.join(file_name);
+        if let Ok(dest_meta) = fs::metadata(&dest_candidate) {
+            let src_size = fs::metadata(src).map(|m| m.len()).unwrap_or(0);
+            if dest_meta.len() == src_size
+                && let Ok(dest_mtime) = dest_meta.modified()
+            {
+                let dest_ts = systemtime_to_timestamp(dest_mtime);
+                let diff_ms = (dest_ts - ref_ts).get_milliseconds().unsigned_abs();
+                if diff_ms <= 100 {
+                    return Ok(TransferOutcome::SkippedQuickMatch);
+                }
+            }
+        }
+    }
 
     let src_hash = hash_file(src)?;
 
@@ -351,6 +403,24 @@ fn stamp_mtime(path: &Path, recorded_at: Timestamp) {
             %error,
             "could not set destination file's modification time"
         );
+    }
+}
+
+/// Converts a `std::time::SystemTime` to a `jiff::Timestamp` for
+/// mtime comparisons. `SystemTime` can represent times before the
+/// Unix epoch (negative duration); `jiff::Timestamp::from_second`
+/// handles negative values, so the conversion is lossless for any
+/// real filesystem mtime. Design D3 / task 3.5.
+fn systemtime_to_timestamp(t: std::time::SystemTime) -> Timestamp {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => Timestamp::new(d.as_secs() as i64, d.subsec_nanos() as i32)
+            .unwrap_or(Timestamp::UNIX_EPOCH),
+        Err(e) => {
+            // Before epoch — negate the duration.
+            let d = e.duration();
+            Timestamp::new(-(d.as_secs() as i64), -(d.subsec_nanos() as i32))
+                .unwrap_or(Timestamp::UNIX_EPOCH)
+        }
     }
 }
 
@@ -506,7 +576,7 @@ mod tests {
             }],
         };
 
-        let report = execute_inner(&plan, true, false, false, false).unwrap();
+        let report = execute_inner(&plan, true, false, false, false, false).unwrap();
 
         assert!(src.exists(), "deletion must be skipped, not assumed");
         assert!(!report.groups[0].deleted_from_source);
@@ -520,7 +590,7 @@ mod tests {
         fs::write(&src, b"hello").unwrap();
         let dest_dir = dir.path().join("dest");
 
-        let outcome = transfer_file(&src, &dest_dir, None).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, None, false).unwrap();
         assert_eq!(outcome, TransferOutcome::Transferred);
         assert_eq!(fs::read(dest_dir.join("clip.mp4")).unwrap(), b"hello");
         assert!(src.exists(), "transfer never deletes the source");
@@ -536,7 +606,7 @@ mod tests {
         fs::create_dir_all(&dest_dir).unwrap();
         fs::write(dest_dir.join("clip.mp4"), b"hello").unwrap();
 
-        let outcome = transfer_file(&src, &dest_dir, None).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, None, false).unwrap();
         assert_eq!(outcome, TransferOutcome::SkippedIdentical);
     }
 
@@ -550,7 +620,7 @@ mod tests {
         let dest_dir = dir.path().join("dest");
 
         let recorded_at: Timestamp = "2026-07-09T07:41:03Z".parse().unwrap();
-        let outcome = transfer_file(&src, &dest_dir, Some(recorded_at)).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, Some(recorded_at), false).unwrap();
         assert_eq!(outcome, TransferOutcome::Transferred);
 
         let dest_path = dest_dir.join("clip.mp4");
@@ -596,7 +666,7 @@ mod tests {
             }],
         };
 
-        execute(&plan, false, false, false).unwrap();
+        execute(&plan, false, false, false, false).unwrap();
 
         let mtime = fs::metadata(quarantine_dir.join("clip.mp4"))
             .unwrap()
@@ -627,7 +697,7 @@ mod tests {
             .unwrap();
 
         let recorded_at: Timestamp = "2026-07-09T07:41:03Z".parse().unwrap();
-        let outcome = transfer_file(&src, &dest_dir, Some(recorded_at)).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, Some(recorded_at), false).unwrap();
         assert_eq!(outcome, TransferOutcome::SkippedIdentical);
 
         let mtime_after = fs::metadata(&dest_path).unwrap().modified().unwrap();
@@ -644,7 +714,7 @@ mod tests {
         fs::write(&src, b"hello").unwrap();
         let dest_dir = dir.path().join("dest");
 
-        let outcome = transfer_file(&src, &dest_dir, None).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, None, false).unwrap();
         assert_eq!(outcome, TransferOutcome::Transferred);
         // No panic and a normal outcome is the whole point here: with
         // `recorded_at: None`, `transfer_inner` never calls
@@ -682,7 +752,7 @@ mod tests {
             }],
         };
 
-        let report = execute(&plan, false, false, false).unwrap();
+        let report = execute(&plan, false, false, false, false).unwrap();
 
         assert!(matches!(
             report.groups[0].sidecar_outcome,
@@ -715,7 +785,7 @@ mod tests {
             }],
         };
 
-        let report = execute(&plan, true, false, true).unwrap();
+        let report = execute(&plan, true, false, true, false).unwrap();
 
         assert!(matches!(
             report.groups[0].sidecar_outcome,
@@ -737,7 +807,7 @@ mod tests {
         fs::create_dir_all(&dest_dir).unwrap();
         fs::write(dest_dir.join("clip.mp4"), b"old-bytes").unwrap();
 
-        let outcome = transfer_file(&src, &dest_dir, None).unwrap();
+        let outcome = transfer_file(&src, &dest_dir, None, false).unwrap();
         let TransferOutcome::Suffixed(path) = outcome else {
             panic!("expected Suffixed, got different outcome");
         };

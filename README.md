@@ -100,7 +100,22 @@ than the camera's clock, which drifts and (on GoPros) is local time
 mismarked as UTC. The sidecar then records `"time_source": "gps"`, the
 session's `clock_offset_s` in the `gopro` device block, and each marker's
 corrected timestamp plus `lat`/`lon` (omitted for a marker with no nearby
-fix) in the `events[]` array. Imported files' mtime is
+fix), plus the chapter `file` it was pressed in and a human-readable `offset`
+string (`M:SS.mmm`), in the `events[]` array. Example marker event:
+
+```json
+{
+  "type": "gopro:marker",
+  "time": "2026-07-04T15:23:51+03:00",
+  "lat": 54.6872,
+  "lon": 25.2797,
+  "offset_ms": 734120,
+  "offset": "12:14.120",
+  "file": "GX010123.MP4"
+}
+```
+
+Imported files' mtime is
 set to this corrected recording time after the verified copy completes —
 file content is untouched either way. Without usable telemetry (no `gpmd`
 track, no fix, or unparseable data), everything falls back to today's
@@ -170,6 +185,12 @@ Useful flags:
 - `--dry-run` — print the plan and stop (same as `scan`, but via `import`)
 - `--keep-source` — never delete source files, even if the profile requests it
 - `--yes` — skip the confirmation prompt before deleting source files
+- `--quick-match` — skip content hashing when the destination file's name,
+  size, and mtime match within 0.1 s of the source's recording time. Useful
+  for regenerating `import.json` on already-imported footage without
+  re-hashing gigabytes of video. Files accepted this way are never deletion
+  candidates (ADR 0009). Recipe: `import <profile> --quick-match --keep-source`
+  re-imports metadata and rewrites sidecars cheaply.
 - `-v` / `-vv` — increase log verbosity; also expands the plan output (`scan` /
   `import --dry-run`): shows quarantined sessions and per-marker details,
   which are otherwise collapsed into the closing summary line

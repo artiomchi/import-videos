@@ -56,6 +56,13 @@ pub enum Command {
         /// Assume "yes" at confirmation prompts
         #[arg(long)]
         yes: bool,
+
+        /// Skip content hashing when the destination file's name, size,
+        /// and mtime match within 0.1 s. Useful for regenerating
+        /// `import.json` on already-imported footage. Files matched this
+        /// way are never deletion candidates (ADR 0009).
+        #[arg(long)]
+        quick_match: bool,
     },
 }
 

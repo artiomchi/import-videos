@@ -136,6 +136,7 @@ impl GoproSource {
                     offset_ms,
                     wall_time,
                     coords,
+                    file: file_name(path),
                 });
             }
         }
@@ -219,6 +220,10 @@ struct MarkerHit {
     /// Nearest usable GPS fix (design D5); `None` when telemetry is
     /// unavailable or no usable fix was found near this marker.
     coords: Option<(f64, f64)>,
+    /// Base name of the chapter file this marker was pressed in
+    /// (design D5). Captured at construction so `build_sidecar` can
+    /// attribute each event to its originating clip.
+    file: String,
 }
 
 fn build_sidecar(
@@ -240,6 +245,7 @@ fn build_sidecar(
             lon: hit.coords.map(|(_, lon)| lon),
             reason: None,
             offset_ms: Some(hit.offset_ms),
+            file: Some(hit.file.clone()),
         })
         .collect();
 

@@ -483,3 +483,70 @@ fn unmarked_session_without_telemetry_is_still_quarantined() {
         "unmarked session must still be quarantined, telemetry notwithstanding"
     );
 }
+
+// --- 7.1: multi-chapter session — each marker carries its chapter file + human offset ---
+
+#[test]
+fn multi_chapter_markers_carry_file_and_offset() {
+    // Two chapters in one session; each has one marker at a different
+    // offset. The sidecar's events[] should name the originating chapter
+    // file and include both `offset_ms` and the rendered `offset` string.
+    let dir = tempfile::tempdir().unwrap();
+    let card = dir.path().join("card");
+
+    let ts = "2026-07-09T12:00:00Z";
+    // Chapter 1: marker at 5000 ms (0:05.000)
+    write_chapter(
+        &card.join("DCIM/100GOPRO/GX010123.MP4"),
+        ts,
+        &[5000],
+        Gpmd::None,
+    );
+    // Chapter 2: marker at 734120 ms (12:14.120)
+    write_chapter(
+        &card.join("DCIM/100GOPRO/GX020123.MP4"),
+        ts,
+        &[734120],
+        Gpmd::None,
+    );
+
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    gopro_config(&config_path, &dest, "");
+
+    let status = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "import",
+            "gopro",
+            "--source",
+            card.to_str().unwrap(),
+            "--yes",
+        ])
+        .stdin(std::process::Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0));
+
+    let sidecar_path = dest.join("2026/2026-07-09/import.json");
+    assert!(sidecar_path.exists(), "sidecar must be written");
+
+    let sidecar = read_sidecar(&sidecar_path);
+    let events = sidecar["events"]
+        .as_array()
+        .expect("events must be an array");
+    assert_eq!(events.len(), 2, "two markers across two chapters");
+
+    // First event: chapter 1 (GX010123.MP4), offset 5000 ms.
+    let e0 = &events[0];
+    assert_eq!(e0["offset_ms"], 5000);
+    assert_eq!(e0["offset"], "0:05.000");
+    assert_eq!(e0["file"], "GX010123.MP4");
+
+    // Second event: chapter 2 (GX020123.MP4), offset 734120 ms.
+    let e1 = &events[1];
+    assert_eq!(e1["offset_ms"], 734120);
+    assert_eq!(e1["offset"], "12:14.120");
+    assert_eq!(e1["file"], "GX020123.MP4");
+}

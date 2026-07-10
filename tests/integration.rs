@@ -172,7 +172,7 @@ fn execution_follows_the_plan() {
     )
     .unwrap();
 
-    let report = transfer::execute(&import_plan, false, false, false).unwrap();
+    let report = transfer::execute(&import_plan, false, false, false, false).unwrap();
 
     assert_eq!(
         fs::read(dest.join("1970/1970-01-01/keep.mp4")).unwrap(),
@@ -234,7 +234,7 @@ fn transfer_failure_keeps_source_and_does_not_block_other_groups() {
         ],
     };
 
-    let report = transfer::execute(&import_plan, false, false, false).unwrap();
+    let report = transfer::execute(&import_plan, false, false, false, false).unwrap();
 
     let ok_group = report.groups.iter().find(|g| g.group_name == "ok").unwrap();
     assert!(matches!(
@@ -300,7 +300,7 @@ fn rerunning_import_is_idempotent() {
         .unwrap()
     };
 
-    let first = transfer::execute(&make_plan(), false, false, false).unwrap();
+    let first = transfer::execute(&make_plan(), false, false, false, false).unwrap();
     assert!(matches!(
         first.groups[0].files[0].outcome,
         TransferOutcome::Transferred
@@ -308,7 +308,7 @@ fn rerunning_import_is_idempotent() {
 
     let dest_snapshot = tree_snapshot(&dest);
 
-    let second = transfer::execute(&make_plan(), false, false, false).unwrap();
+    let second = transfer::execute(&make_plan(), false, false, false, false).unwrap();
     assert!(matches!(
         second.groups[0].files[0].outcome,
         TransferOutcome::SkippedIdentical
@@ -342,7 +342,7 @@ fn different_content_at_destination_gets_suffixed() {
     )
     .unwrap();
 
-    let report = transfer::execute(&import_plan, false, false, false).unwrap();
+    let report = transfer::execute(&import_plan, false, false, false, false).unwrap();
 
     assert!(matches!(
         report.groups[0].files[0].outcome,
@@ -374,7 +374,7 @@ fn keep_source_flag_overrides_delete_source() {
     .unwrap();
 
     // keep_source = true overrides the profile for this run.
-    transfer::execute(&import_plan, prof.delete_source, true, true).unwrap();
+    transfer::execute(&import_plan, prof.delete_source, true, true, false).unwrap();
 
     assert!(src.exists(), "--keep-source must prevent source deletion");
 }
@@ -400,7 +400,7 @@ fn delete_source_removes_file_after_confirmed_transfer() {
     )
     .unwrap();
 
-    let report = transfer::execute(&import_plan, true, false, true).unwrap();
+    let report = transfer::execute(&import_plan, true, false, true, false).unwrap();
 
     assert!(report.groups[0].deleted_from_source);
     assert!(!src.exists());
@@ -552,7 +552,7 @@ fn disabled_quarantine_copy_leaves_source_and_creates_no_dir() {
         &jiff::tz::TimeZone::UTC,
     )
     .unwrap();
-    let report = transfer::execute(&import_plan, false, false, false).unwrap();
+    let report = transfer::execute(&import_plan, false, false, false, false).unwrap();
 
     // Source must be untouched.
     assert!(
@@ -620,7 +620,7 @@ fn disabled_quarantine_copy_source_not_deleted_even_with_delete_source() {
     )
     .unwrap();
     // assume_yes = true to skip the interactive prompt.
-    let report = transfer::execute(&import_plan, true, false, true).unwrap();
+    let report = transfer::execute(&import_plan, true, false, true, false).unwrap();
 
     // The Keep group's source is deleted after a verified transfer.
     assert!(
@@ -645,4 +645,170 @@ fn disabled_quarantine_copy_source_not_deleted_even_with_delete_source() {
         .find(|g| g.group_name == "unmarked")
         .unwrap();
     assert!(!quarantine_group.deleted_from_source);
+}
+
+// --- Quick-match tests (tasks 7.2-7.4) ---
+
+/// Stamps a file's mtime to the given `jiff::Timestamp` (mirrors
+/// `transfer_file`'s behaviour so the test can set up an
+/// already-imported destination without re-running the full import).
+fn stamp_mtime(path: &std::path::Path, recorded_at: jiff::Timestamp) {
+    let file = std::fs::File::options().write(true).open(path).unwrap();
+    file.set_modified(std::time::SystemTime::from(recorded_at))
+        .unwrap();
+}
+
+fn media_file_with_ts(path: &Path, recorded_at: jiff::Timestamp) -> MediaFile {
+    MediaFile {
+        path: path.to_path_buf(),
+        size: fs::metadata(path).unwrap().len(),
+        recorded_at: Some(recorded_at),
+    }
+}
+
+fn group_with_ts(name: &str, files: Vec<MediaFile>) -> MediaGroup {
+    MediaGroup {
+        name: name.to_string(),
+        files,
+        timestamp: ts(0),
+        markers: vec![],
+        geo: None,
+        context: HashMap::new(),
+        sidecar: None,
+    }
+}
+
+// 7.2: quick-match hit — destination has same name, size, mtime → SkippedQuickMatch
+#[test]
+fn quick_match_hit_skips_hashing_and_reports_distinct_outcome() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorded_at = ts(1_751_641_431); // arbitrary fixed instant
+
+    let src = dir.path().join("source/clip.mp4");
+    write_file(&src, b"footage bytes");
+    let dest_dir = dir.path().join("dest/1970/1970-01-01");
+    let dest_file = dest_dir.join("clip.mp4");
+    // Pre-place a destination file with the same content and matching mtime.
+    fs::create_dir_all(&dest_dir).unwrap();
+    fs::write(&dest_file, b"footage bytes").unwrap();
+    stamp_mtime(&dest_file, recorded_at);
+
+    let source_impl = TestSource {
+        groups: vec![(
+            group_with_ts("a", vec![media_file_with_ts(&src, recorded_at)]),
+            Verdict::Keep,
+        )],
+    };
+    let prof = profile(&dir.path().join("dest"), None, false);
+    let import_plan = plan::build_plan(
+        &prof,
+        &source_impl,
+        Path::new("/ignored"),
+        &jiff::tz::TimeZone::UTC,
+    )
+    .unwrap();
+
+    let report = transfer::execute(&import_plan, false, false, false, true).unwrap();
+
+    assert_eq!(
+        report.groups[0].files[0].outcome,
+        TransferOutcome::SkippedQuickMatch,
+        "same-name + same-size + matching mtime must return SkippedQuickMatch"
+    );
+    // Source is untouched (no delete_source).
+    assert!(src.exists());
+}
+
+// 7.3: quick-match miss (size differs) → falls through to verified transfer
+#[test]
+fn quick_match_miss_on_size_difference_falls_through_to_verified_transfer() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorded_at = ts(1_751_641_431);
+
+    let src = dir.path().join("source/clip.mp4");
+    write_file(&src, b"footage bytes long");
+    let dest_dir = dir.path().join("dest/1970/1970-01-01");
+    let dest_file = dest_dir.join("clip.mp4");
+    // Pre-place a destination file with *different* content (size mismatch).
+    fs::create_dir_all(&dest_dir).unwrap();
+    fs::write(&dest_file, b"short").unwrap();
+    stamp_mtime(&dest_file, recorded_at);
+
+    let source_impl = TestSource {
+        groups: vec![(
+            group_with_ts("a", vec![media_file_with_ts(&src, recorded_at)]),
+            Verdict::Keep,
+        )],
+    };
+    let prof = profile(&dir.path().join("dest"), None, false);
+    let import_plan = plan::build_plan(
+        &prof,
+        &source_impl,
+        Path::new("/ignored"),
+        &jiff::tz::TimeZone::UTC,
+    )
+    .unwrap();
+
+    let report = transfer::execute(&import_plan, false, false, false, true).unwrap();
+
+    // Size mismatch → miss → falls through to full verified transfer; content
+    // differs from destination, so it gets suffixed.
+    assert!(
+        matches!(
+            report.groups[0].files[0].outcome,
+            TransferOutcome::Suffixed(_) | TransferOutcome::Transferred
+        ),
+        "size mismatch must fall through, not return SkippedQuickMatch; got {:?}",
+        report.groups[0].files[0].outcome
+    );
+}
+
+// 7.4: safety invariant — quick-matched group with delete_source: true + --yes
+//      leaves all source files in place (content was not verified).
+#[test]
+fn fully_quick_matched_group_is_never_deleted_even_with_delete_source_and_yes() {
+    let dir = tempfile::tempdir().unwrap();
+    let recorded_at = ts(1_751_641_431);
+
+    let src = dir.path().join("source/clip.mp4");
+    write_file(&src, b"footage");
+    let dest_dir = dir.path().join("dest/1970/1970-01-01");
+    let dest_file = dest_dir.join("clip.mp4");
+    fs::create_dir_all(&dest_dir).unwrap();
+    fs::write(&dest_file, b"footage").unwrap();
+    stamp_mtime(&dest_file, recorded_at);
+
+    let source_impl = TestSource {
+        groups: vec![(
+            group_with_ts("a", vec![media_file_with_ts(&src, recorded_at)]),
+            Verdict::Keep,
+        )],
+    };
+    let prof = profile(&dir.path().join("dest"), None, true); // delete_source: true
+    let import_plan = plan::build_plan(
+        &prof,
+        &source_impl,
+        Path::new("/ignored"),
+        &jiff::tz::TimeZone::UTC,
+    )
+    .unwrap();
+
+    // delete_source=true, assume_yes=true, quick_match=true
+    let report = transfer::execute(&import_plan, true, false, true, true).unwrap();
+
+    // The group must be SkippedQuickMatch (not content-verified).
+    assert_eq!(
+        report.groups[0].files[0].outcome,
+        TransferOutcome::SkippedQuickMatch
+    );
+    // Source MUST still exist — quick-match forfeits deletion eligibility.
+    assert!(
+        src.exists(),
+        "source must not be deleted when group was only quick-matched (ADR 0009)"
+    );
+    // deleted_from_source must be false.
+    assert!(
+        !report.groups[0].deleted_from_source,
+        "deleted_from_source must be false for a quick-matched group"
+    );
 }

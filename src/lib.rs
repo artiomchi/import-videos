@@ -52,6 +52,7 @@ fn run_inner(cli: Cli) -> Result<ExitCode> {
             dry_run,
             keep_source,
             yes,
+            quick_match,
         } => run_import(
             &cfg,
             &profile,
@@ -59,6 +60,7 @@ fn run_inner(cli: Cli) -> Result<ExitCode> {
             dry_run,
             keep_source,
             yes,
+            quick_match,
             verbose,
         ),
     }
@@ -117,6 +119,7 @@ fn run_scan(
     Ok(ExitCode::Success)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_import(
     cfg: &config::Config,
     profile_name: &str,
@@ -124,6 +127,7 @@ fn run_import(
     dry_run: bool,
     keep_source_flag: bool,
     assume_yes: bool,
+    quick_match: bool,
     verbose: bool,
 ) -> Result<ExitCode> {
     let profile = get_profile(cfg, profile_name)?;
@@ -146,6 +150,7 @@ fn run_import(
         profile.delete_source,
         keep_source_flag,
         assume_yes,
+        quick_match,
     )?;
     print!("{}", report::render_results(&exec_report));
 
