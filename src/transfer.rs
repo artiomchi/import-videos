@@ -72,6 +72,11 @@ impl Progress {
             bar.finish_and_clear();
         }
     }
+
+    #[cfg(test)]
+    fn position(&self) -> u64 {
+        self.bar.as_ref().map(|b| b.position()).unwrap_or(0)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +232,18 @@ fn execute_inner(
                     quick_match,
                     progress,
                 )?;
+                // `copy_and_hash` only ticks bytes for files it actually
+                // streams; a quick-match or identical-content skip never
+                // reaches it, even though its bytes are counted in
+                // `total_bytes` above. Without this, a re-run that skips
+                // most files would leave the bar stalled near 0% instead
+                // of reflecting real completion.
+                if matches!(
+                    outcome,
+                    TransferOutcome::SkippedQuickMatch | TransferOutcome::SkippedIdentical
+                ) {
+                    progress.inc(media_file.size);
+                }
                 files.push(FileResult {
                     src: media_file.path.clone(),
                     outcome,
@@ -978,5 +995,101 @@ mod tests {
         let progress = Progress::new(true);
         let outcome = transfer_file(&src, &dest_dir, None, false, &progress).unwrap();
         assert_eq!(outcome, TransferOutcome::Transferred);
+    }
+
+    #[test]
+    fn skipped_identical_still_advances_progress_by_full_size() {
+        // `copy_and_hash` never runs for a content-identical skip, so
+        // nothing ticks the bar unless `execute_inner` does it itself —
+        // otherwise a re-run over already-imported footage would leave
+        // the bar stalled near 0% despite doing exactly the "work" its
+        // total already counted.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        let content = b"hello world";
+        fs::write(&src, content).unwrap();
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir_all(&dest_dir).unwrap();
+        fs::write(dest_dir.join("clip.mp4"), content).unwrap();
+
+        let group = MediaGroup {
+            name: "a".to_string(),
+            files: vec![MediaFile {
+                path: src.clone(),
+                size: content.len() as u64,
+                recorded_at: None,
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group,
+                verdict: Verdict::Keep,
+                destination: Some(dest_dir.clone()),
+                quarantine_path: None,
+            }],
+        };
+
+        let progress = Progress::new(true);
+        let report = execute(&plan, false, false, false, false, &progress).unwrap();
+        assert!(matches!(
+            report.groups[0].files[0].outcome,
+            TransferOutcome::SkippedIdentical
+        ));
+        assert_eq!(progress.position(), content.len() as u64);
+    }
+
+    #[test]
+    fn skipped_quick_match_still_advances_progress_by_full_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        let content = b"hello world";
+        fs::write(&src, content).unwrap();
+        let dest_dir = dir.path().join("dest");
+        fs::create_dir_all(&dest_dir).unwrap();
+        let dest_path = dest_dir.join("clip.mp4");
+        fs::write(&dest_path, content).unwrap();
+
+        let recorded_at = ts(0);
+        File::options()
+            .write(true)
+            .open(&dest_path)
+            .unwrap()
+            .set_modified(std::time::SystemTime::from(recorded_at))
+            .unwrap();
+
+        let group = MediaGroup {
+            name: "a".to_string(),
+            files: vec![MediaFile {
+                path: src.clone(),
+                size: content.len() as u64,
+                recorded_at: Some(recorded_at),
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group,
+                verdict: Verdict::Keep,
+                destination: Some(dest_dir.clone()),
+                quarantine_path: None,
+            }],
+        };
+
+        let progress = Progress::new(true);
+        let report = execute(&plan, false, false, false, true, &progress).unwrap();
+        assert!(matches!(
+            report.groups[0].files[0].outcome,
+            TransferOutcome::SkippedQuickMatch
+        ));
+        assert_eq!(progress.position(), content.len() as u64);
     }
 }
