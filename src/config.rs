@@ -17,6 +17,7 @@ pub use layout::LayoutTemplate;
 
 use crate::error::{Error, Result};
 use crate::source::gopro::GoproSource;
+use crate::source::tesla::{self, EventCategory, Reasons, TeslaSource};
 use crate::source::{GenericSource, ImportSource};
 
 /// Device-specific profile fields, an internally tagged enum on `type`
@@ -39,6 +40,12 @@ pub enum SourceKind {
         #[serde(default = "default_require_marker")]
         require_marker: bool,
     },
+    Tesla {
+        #[serde(default = "tesla::default_events")]
+        events: Vec<EventCategory>,
+        #[serde(default)]
+        reasons: Option<Reasons>,
+    },
 }
 
 fn default_require_marker() -> bool {
@@ -57,6 +64,10 @@ impl SourceKind {
             SourceKind::Generic => Box::new(GenericSource),
             SourceKind::Gopro { require_marker } => Box::new(GoproSource {
                 require_marker: *require_marker,
+            }),
+            SourceKind::Tesla { events, reasons } => Box::new(TeslaSource {
+                events: events.clone(),
+                reasons: reasons.clone(),
             }),
         }
     }
@@ -156,6 +167,10 @@ pub fn load(path: &Path) -> Result<Config> {
             .as_mapping()
             .map(|m| m.get("require_marker").is_some())
             .unwrap_or(false);
+        let has_tesla_field = raw_value
+            .as_mapping()
+            .map(|m| m.get("events").is_some() || m.get("reasons").is_some())
+            .unwrap_or(false);
 
         let raw_profile: RawProfile = serde_yaml_ng::from_value(raw_value)
             .map_err(|e| Error::Config(format!("profile '{name}': {e}")))?;
@@ -163,6 +178,11 @@ pub fn load(path: &Path) -> Result<Config> {
         if has_require_marker && !matches!(raw_profile.kind, SourceKind::Gopro { .. }) {
             return Err(Error::Config(format!(
                 "profile '{name}': require_marker is only valid for profiles of type gopro"
+            )));
+        }
+        if has_tesla_field && !matches!(raw_profile.kind, SourceKind::Tesla { .. }) {
+            return Err(Error::Config(format!(
+                "profile '{name}': events/reasons are only valid for profiles of type tesla"
             )));
         }
 
@@ -452,5 +472,116 @@ profiles:
                 require_marker: true
             }
         );
+    }
+
+    // --- Tesla profile (add-tesla-import, design D5) ---
+
+    #[test]
+    fn tesla_profile_defaults_events_and_no_reason_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  tesla:\n    type: tesla\n    source: auto\n    destination: {}\n    layout: \"{{event_type}}\"\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = load(&path).unwrap();
+        assert_eq!(
+            cfg.profiles.get("tesla").unwrap().kind,
+            SourceKind::Tesla {
+                events: tesla::default_events(),
+                reasons: None,
+            }
+        );
+    }
+
+    #[test]
+    fn tesla_reasons_allow_and_deny_together_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  tesla:\n    type: tesla\n    source: auto\n    destination: {}\n    layout: \"{{event_type}}\"\n    reasons:\n      allow: [user_interaction_honk]\n      deny: [sentry_aware_object_detection]\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&path).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("tesla"));
+        assert_eq!(err.exit_code(), crate::error::ExitCode::UsageOrConfig);
+    }
+
+    #[test]
+    fn tesla_reasons_empty_block_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  tesla:\n    type: tesla\n    source: auto\n    destination: {}\n    layout: \"{{event_type}}\"\n    reasons: {{}}\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&path).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+    }
+
+    #[test]
+    fn tesla_fields_rejected_on_non_tesla_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  cam:\n    type: gopro\n    events: [saved]\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&path).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("cam"));
+        assert!(err.to_string().contains("events"));
+        assert_eq!(err.exit_code(), crate::error::ExitCode::UsageOrConfig);
+    }
+
+    #[test]
+    fn tesla_variant_serde_round_trips() {
+        // Same risk as the Generic/Gopro round-trips above (design
+        // Risks): flatten + internally-tagged enum. `reasons` stays
+        // `None` here deliberately: `Reasons` is itself a data-carrying
+        // enum, and serde's `flatten` combinator cannot round-trip a
+        // *nested* enum serialized in its default (tag-based) YAML form
+        // — a documented serde limitation, not a bug in `Reasons`
+        // itself (see `reasons_round_trips_outside_flatten` in
+        // `source::tesla`, and the config-loading tests above, which
+        // exercise the real load path: hand-written YAML through
+        // `serde_yaml_ng::Value`, never through `Serialize`).
+        let original = RawProfile {
+            kind: SourceKind::Tesla {
+                events: vec![EventCategory::Saved, EventCategory::Recent],
+                reasons: None,
+            },
+            source: "auto".to_string(),
+            destination: "/tmp/dest".to_string(),
+            layout: "{event_type}".to_string(),
+            ignore: vec![],
+            quarantine: None,
+            delete_source: false,
+        };
+
+        let yaml = serde_yaml_ng::to_string(&original).unwrap();
+        let round_tripped: RawProfile = serde_yaml_ng::from_str(&yaml).unwrap();
+        assert_eq!(original, round_tripped);
     }
 }

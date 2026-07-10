@@ -10,8 +10,9 @@ Every import is **scan → plan → execute**: a read-only scan produces a plan
 (what will be kept, quarantined, or ignored, and why); nothing is copied,
 moved, or deleted until you review that plan and run `import`.
 
-GoPro HERO8 is the first supported device (Tesla and others follow in
-later changesets). See "What gets kept" below for its keep/quarantine rule.
+GoPro HERO8 and Tesla dashcam/sentry footage are supported today; other
+devices follow in later changesets. See "What gets kept" below for each
+device's keep/quarantine (or, for Tesla, keep/filter) rule.
 
 ## Install
 
@@ -44,6 +45,16 @@ profiles:
     quarantine: ~/Videos/commute/_quarantine
     delete_source: true
     require_marker: true      # gopro-specific: see "What gets kept" below
+
+  dashcam:
+    type: tesla
+    source: auto               # or an explicit path, e.g. /media/alice/TESLA
+    destination: ~/Videos/tesla
+    layout: "{event_type}/{event_date}/{event_time}"
+    events: [saved, sentry]     # tesla-specific: default shown; add `recent` to import RecentClips too
+    reasons:
+      deny: [sentry_aware_object_detection]   # or `allow: [...]` — not both
+    delete_source: true
 ```
 
 Common fields, available to every profile:
@@ -59,11 +70,14 @@ Common fields, available to every profile:
 | `delete_source` | Delete source files after a verified transfer (per-run: `--keep-source` overrides) |
 
 Device-specific fields (only valid on their own `type`; e.g. `require_marker`
-on a non-`gopro` profile fails config loading):
+on a non-`gopro` profile, or `events`/`reasons` on a non-`tesla` profile,
+fails config loading):
 
 | Field            | Type    | Meaning                                                                 |
 | ---------------- | ------- | ------------------------------------------------------------------------ |
 | `require_marker` | `gopro` | Whether a session needs a HiLight marker to be kept (default `true`)     |
+| `events`         | `tesla` | Event categories to import: any of `saved`, `sentry`, `recent` (default `[saved, sentry]`) |
+| `reasons`        | `tesla` | `allow: [...]` or `deny: [...]` (not both) — filters by `event.json`'s trigger `reason` |
 
 ### What gets kept — GoPro
 
@@ -94,6 +108,42 @@ crosses midnight UTC lands in the UTC calendar date, which can read as the
 "wrong" local day for a late-evening ride. A `{date:local:...}` layout
 field to resolve against local time instead is a possible future addition,
 not something this changeset does.
+
+### What gets kept — Tesla
+
+A TeslaCam drive's `SavedClips/<timestamp>/` and `SentryClips/<timestamp>/`
+folders each become one event: every file inside — camera-angle clips,
+`event.json`, `thumb.png`, anything else — travels together as one atomic
+unit. `events` picks which categories are even considered (default `saved`
+and `sentry`; add `recent` to also import the flat `RecentClips/` rolling
+buffer, clustered into one group per shared per-minute filename stem).
+Within an enabled category, `reasons` optionally filters by `event.json`'s
+trigger `reason` (e.g. keep `user_interaction_honk`, drop the noisy
+`sentry_aware_object_detection`) — `allow` keeps only listed reasons,
+`deny` drops only listed reasons (not both). An event whose reason can't
+be determined at all (missing/corrupt `event.json`) is always kept: a
+filter miss costs disk space, a false drop costs evidence. Unlike GoPro,
+filtered-out Tesla events are never quarantined — they get a visible
+`Ignore` verdict in `scan` output and are left untouched on the card,
+since excluding them is a deliberate, reversible config choice, not
+uncertainty about whether the footage matters.
+
+Event timestamps are the vehicle's own local wall clock (see ADR 0006):
+destination folders reproduce that wall clock via the `event_type`,
+`event_date`, and `event_time` context fields (e.g.
+`{event_type}/{event_date}/{event_time}` → `saved/2026-07-04/18-23-51`,
+matching what the car's screen and the card's own folder names show),
+while each clip's `recorded_at`/mtime is resolved as a real instant in
+the importing machine's system timezone. If the vehicle and the
+importing machine are in different timezones, mtimes skew by the
+difference but folder names stay correct. A corrupt or missing
+`event.json` falls back to the event folder's own name for the
+timestamp; if neither is parseable, the event is `Ignore`d rather than
+imported with a guessed time. Each kept event gets a normalized
+`import.json` sidecar: device type, event type, source path, the parsed
+`event.json` fields, resolved wall-clock and UTC times with the
+timestamp's provenance (`event_json` or `folder_name`), and the file
+list.
 
 `layout` is a small template language: `{date:%Y}/{date:%Y-%m-%d}` resolves
 `{date...}` against the media group's timestamp via

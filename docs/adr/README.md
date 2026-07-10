@@ -9,3 +9,4 @@ Lightweight MADR format: **Context / Decision / Consequences**. An ADR is writte
 | [0003](0003-scan-plan-execute-safety-model.md) | Scan → plan → execute safety model | accepted |
 | [0004](0004-yaml-config-with-profile-per-device.md) | YAML config with a profile per device | accepted |
 | [0005](0005-single-crate-trait-based-extensibility.md) | Single crate, trait-based extensibility | accepted |
+| [0006](0006-tesla-wall-clock-naming-vs-system-timezone-instants.md) | Tesla: vehicle-local wall-clock naming vs. system-timezone instants | accepted |

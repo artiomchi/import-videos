@@ -3,6 +3,7 @@
 //! device-specific logic itself.
 
 pub mod gopro;
+pub mod tesla;
 
 use std::collections::HashMap;
 use std::path::Path;
