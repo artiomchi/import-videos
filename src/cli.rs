@@ -81,6 +81,16 @@ pub enum Command {
         #[arg(long)]
         quick_match: bool,
 
+        /// Force copy-on-write cloning on for this run, even if the
+        /// profile sets `reflink: false`
+        #[arg(long, overrides_with = "no_reflink")]
+        reflink: bool,
+
+        /// Force copy-on-write cloning off for this run, even if the
+        /// profile sets `reflink: true`; every file is stream-copied
+        #[arg(long, overrides_with = "reflink")]
+        no_reflink: bool,
+
         #[command(flatten)]
         overrides: OverrideFlags,
     },
@@ -150,9 +160,9 @@ impl OverrideFlags {
     /// (design D5) — neutral data only. `--quarantine`'s implication
     /// of `copy_quarantine: true` and GoPro-only validation of the
     /// marker flags are business rules applied where the override is
-    /// consumed (`lib.rs`), not here. `delete_source` is always `None`
-    /// here since it isn't part of this shared flag set; `Import`
-    /// fills it in separately.
+    /// consumed (`lib.rs`), not here. `delete_source` and `reflink` are
+    /// always `None` here since neither is part of this shared flag
+    /// set; `Import` fills them in separately.
     pub fn to_overrides(&self) -> Overrides {
         Overrides {
             delete_source: None,
@@ -162,6 +172,7 @@ impl OverrideFlags {
                 self.no_gopro_require_marker,
             ),
             quarantine: self.quarantine.clone(),
+            reflink: None,
         }
     }
 }
@@ -175,6 +186,7 @@ pub struct Overrides {
     pub copy_quarantine: Option<bool>,
     pub gopro_require_marker: Option<bool>,
     pub quarantine: Option<PathBuf>,
+    pub reflink: Option<bool>,
 }
 
 /// Collapses a paired override flag (`--foo`/`--no-foo`) to

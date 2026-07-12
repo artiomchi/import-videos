@@ -250,6 +250,7 @@ mod tests {
             quarantine,
             delete_source: false,
             copy_quarantine: true,
+            reflink: true,
         }
     }
 

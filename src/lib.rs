@@ -64,11 +64,14 @@ fn run_inner(cli: Cli) -> Result<ExitCode> {
             no_delete_source,
             yes,
             quick_match,
+            reflink,
+            no_reflink,
             overrides,
         } => {
             let cfg = load_config(cli.config.as_deref())?;
             let mut overrides = overrides.to_overrides();
             overrides.delete_source = cli::override_pair(delete_source, no_delete_source);
+            overrides.reflink = cli::override_pair(reflink, no_reflink);
             run_import(
                 &cfg,
                 &profile,
@@ -141,6 +144,10 @@ fn apply_overrides(
 
     if let Some(delete_source) = overrides.delete_source {
         profile.delete_source = delete_source;
+    }
+
+    if let Some(reflink) = overrides.reflink {
+        profile.reflink = reflink;
     }
 
     if let Some(copy_quarantine) = overrides.copy_quarantine {
@@ -312,6 +319,7 @@ fn run_import(
         profile.delete_source,
         assume_yes,
         quick_match,
+        profile.reflink,
         &progress,
     )?;
 
@@ -421,5 +429,58 @@ fn run_inspect(path: &Path, json: bool) -> Result<ExitCode> {
             }
             Ok(ExitCode::Success)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn profile(reflink: bool) -> config::Profile {
+        config::Profile {
+            kind: config::SourceKind::Generic,
+            source: config::SourceLocation::Auto,
+            destination: PathBuf::from("/dest"),
+            layout: config::LayoutTemplate::parse("{date}").unwrap(),
+            ignore: globset::GlobSetBuilder::new().build().unwrap(),
+            quarantine: None,
+            delete_source: false,
+            copy_quarantine: true,
+            reflink,
+        }
+    }
+
+    // --- reflink override resolution (add-reflink-transfer, task 6.6) ---
+
+    #[test]
+    fn reflink_override_forces_cloning_off() {
+        // Spec scenario: "Reflink override forces cloning off"
+        let base = profile(true);
+        let overrides = cli::Overrides {
+            reflink: Some(false),
+            ..Default::default()
+        };
+        let resolved = apply_overrides(&base, &overrides, "cam").unwrap();
+        assert!(!resolved.reflink);
+    }
+
+    #[test]
+    fn reflink_override_forces_cloning_on() {
+        // Spec scenario: "Reflink override forces cloning on"
+        let base = profile(false);
+        let overrides = cli::Overrides {
+            reflink: Some(true),
+            ..Default::default()
+        };
+        let resolved = apply_overrides(&base, &overrides, "cam").unwrap();
+        assert!(resolved.reflink);
+    }
+
+    #[test]
+    fn unset_reflink_override_keeps_the_profile_value() {
+        let base = profile(true);
+        let resolved = apply_overrides(&base, &cli::Overrides::default(), "cam").unwrap();
+        assert!(resolved.reflink);
     }
 }

@@ -16,3 +16,4 @@ Lightweight MADR format: **Context / Decision / Consequences**. An ADR is writte
 | [0010](0010-cleanup-age-is-quarantine-arrival-time.md) | Cleanup age is quarantine arrival time, not recording time | accepted |
 | [0011](0011-cli-overridability-policy.md) | Which profile settings are CLI-overridable, and why | accepted |
 | [0012](0012-copy-verification-reads-back-the-written-file.md) | Copy verification reads back the written file | accepted |
+| [0013](0013-reflink-structural-verification.md) | Reflink structural verification vs. empirical/heuristic verification | accepted |

@@ -310,6 +310,7 @@ fn time_source(sidecar: Option<&Sidecar>) -> Option<&str> {
 #[derive(Default)]
 struct ResultsTally {
     transferred: usize,
+    reflinked: usize,
     skipped_identical: usize,
     skipped_quick_match: usize,
     suffixed: usize,
@@ -328,6 +329,7 @@ impl ResultsTally {
             for file in &group.files {
                 match &file.outcome {
                     TransferOutcome::Transferred => tally.transferred += 1,
+                    TransferOutcome::Reflinked => tally.reflinked += 1,
                     TransferOutcome::SkippedIdentical => tally.skipped_identical += 1,
                     TransferOutcome::SkippedQuickMatch => tally.skipped_quick_match += 1,
                     TransferOutcome::Suffixed(_) => tally.suffixed += 1,
@@ -344,14 +346,22 @@ impl ResultsTally {
     /// The always-present closing line (spec: "Human-readable
     /// execution report is summarized by default"). Quick-matched
     /// skips are counted distinctly from already-imported skips, since
-    /// only the latter were content-verified. The deleted-groups clause
-    /// only appears when deletion was actually requested this run —
-    /// showing "0 deleted from source" on a run that never asked for
-    /// deletion would read as a failure that never happened.
+    /// only the latter were content-verified; likewise reflinked files
+    /// are counted distinctly from stream-copied transfers, since a
+    /// clone is a near-instant kernel operation rather than a full read
+    /// and write of the file's bytes (spec: "Reflinked files are
+    /// counted distinctly"). The deleted-groups clause only appears
+    /// when deletion was actually requested this run — showing "0
+    /// deleted from source" on a run that never asked for deletion
+    /// would read as a failure that never happened.
     fn summary_line(&self, delete_source_in_effect: bool) -> String {
         let mut line = format!(
-            "Summary: {} transferred, {} skipped (already imported), {} quick-matched, {} FAILED",
-            self.transferred, self.skipped_identical, self.skipped_quick_match, self.failed
+            "Summary: {} transferred, {} reflinked, {} skipped (already imported), {} quick-matched, {} FAILED",
+            self.transferred,
+            self.reflinked,
+            self.skipped_identical,
+            self.skipped_quick_match,
+            self.failed
         );
         if delete_source_in_effect {
             let _ = write!(
@@ -407,6 +417,7 @@ fn file_outcome_line(file: &FileResult, include_name: bool) -> String {
     };
     match &file.outcome {
         TransferOutcome::Transferred => format!("transferred: {name}"),
+        TransferOutcome::Reflinked => format!("reflinked (instant): {name}"),
         TransferOutcome::SkippedIdentical => format!("skipped (already imported): {name}"),
         TransferOutcome::SkippedQuickMatch => {
             format!("skipped (quick-matched, not verified): {name}")
@@ -669,6 +680,10 @@ pub struct GroupResultJson {
 #[derive(Debug, Serialize)]
 pub struct ResultsSummaryJson {
     pub transferred: usize,
+    /// Counted distinctly from `transferred` (spec: "Reflinked files
+    /// are counted distinctly") — a clone shares the source's extents
+    /// rather than streaming and re-hashing its bytes.
+    pub reflinked: usize,
     /// Additive (task 7.1): previously folded into an unlabeled
     /// per-file `outcome` string only; broken out here so the human
     /// summary's "skipped (already imported)" / "quick-matched" counts
@@ -693,6 +708,7 @@ pub struct ResultsJson {
 fn outcome_json(outcome: &TransferOutcome) -> (String, Option<String>, Option<String>) {
     match outcome {
         TransferOutcome::Transferred => ("transferred".to_string(), None, None),
+        TransferOutcome::Reflinked => ("reflinked".to_string(), None, None),
         TransferOutcome::SkippedIdentical => ("skipped_identical".to_string(), None, None),
         TransferOutcome::SkippedQuickMatch => ("skipped_quick_match".to_string(), None, None),
         TransferOutcome::SkippedQuarantineDisabled => {
@@ -759,6 +775,7 @@ pub fn results_to_json(report: &ExecuteReport) -> ResultsJson {
         deletion_skipped_reason: report.deletion_skipped_reason.clone(),
         summary: ResultsSummaryJson {
             transferred: tally.transferred,
+            reflinked: tally.reflinked,
             skipped_identical: tally.skipped_identical,
             skipped_quick_match: tally.skipped_quick_match,
             suffixed: tally.suffixed,
@@ -1371,7 +1388,7 @@ mod tests {
         let out = render_results(&report, false);
         assert_eq!(
             out.trim_end(),
-            "Summary: 1 transferred, 1 skipped (already imported), 0 quick-matched, 0 FAILED, 2 groups deleted from source"
+            "Summary: 1 transferred, 0 reflinked, 1 skipped (already imported), 0 quick-matched, 0 FAILED, 2 groups deleted from source"
         );
     }
 
@@ -1461,7 +1478,74 @@ mod tests {
         assert_eq!(lines[1], "  transferred: clip1.mp4");
         assert_eq!(lines[2], "  skipped (already imported): clip2.mp4");
         assert_eq!(lines[3], "  deleted from source");
-        assert!(out.contains("Summary: 1 transferred, 1 skipped"));
+        assert!(out.contains("Summary: 1 transferred, 0 reflinked, 1 skipped"));
+    }
+
+    // --- reflinked outcome rendering (add-reflink-transfer, task 6.7) ---
+
+    #[test]
+    fn reflinked_files_counted_distinctly_and_not_listed_by_default() {
+        // Spec scenario: "Reflinked files are counted distinctly in the
+        // summary" — a run mixing reflinked and stream-copied files
+        // shows the reflinked count separately from transferred, with
+        // neither listed per file by default.
+        let report = ExecuteReport {
+            groups: vec![group_result(
+                "a",
+                vec![
+                    file_result("/card/a1.mp4", TransferOutcome::Transferred),
+                    file_result("/card/a2.mp4", TransferOutcome::Reflinked),
+                ],
+                false,
+                Some("/dest/a"),
+            )],
+            deletion_skipped_reason: None,
+            delete_source: false,
+        };
+
+        let out = render_results(&report, false);
+        assert_eq!(
+            out.trim_end(),
+            "Summary: 1 transferred, 1 reflinked, 0 skipped (already imported), 0 quick-matched, 0 FAILED"
+        );
+
+        let json = results_to_json(&report);
+        assert_eq!(json.summary.transferred, 1);
+        assert_eq!(json.summary.reflinked, 1);
+    }
+
+    #[test]
+    fn reflinked_file_renders_instant_line_with_verbose() {
+        let report = ExecuteReport {
+            groups: vec![group_result(
+                "a",
+                vec![file_result("/card/a1.mp4", TransferOutcome::Reflinked)],
+                true,
+                Some("/dest/a"),
+            )],
+            deletion_skipped_reason: None,
+            delete_source: true,
+        };
+
+        let out = render_results(&report, true);
+        assert!(out.contains("reflinked (instant): a1.mp4"));
+    }
+
+    #[test]
+    fn reflinked_outcome_json_status_is_reflinked() {
+        let report = ExecuteReport {
+            groups: vec![group_result(
+                "a",
+                vec![file_result("/card/a1.mp4", TransferOutcome::Reflinked)],
+                true,
+                Some("/dest/a"),
+            )],
+            deletion_skipped_reason: None,
+            delete_source: true,
+        };
+
+        let json = results_to_json(&report);
+        assert_eq!(json.groups[0].files[0].outcome, "reflinked");
     }
 
     #[test]

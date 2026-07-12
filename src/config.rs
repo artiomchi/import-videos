@@ -99,6 +99,10 @@ pub struct Profile {
     /// it changes. Defaults to `true` (verified-copy behavior, ADR
     /// 0003) when omitted from the YAML.
     pub copy_quarantine: bool,
+    /// When `true`, the transfer engine first attempts a copy-on-write
+    /// clone of each file before falling back to the verified
+    /// stream-copy path. Defaults to `true` when omitted from the YAML.
+    pub reflink: bool,
 }
 
 impl Profile {
@@ -156,9 +160,15 @@ struct RawProfile {
     delete_source: bool,
     #[serde(default = "default_copy_quarantine")]
     copy_quarantine: bool,
+    #[serde(default = "default_reflink")]
+    reflink: bool,
 }
 
 fn default_copy_quarantine() -> bool {
+    true
+}
+
+fn default_reflink() -> bool {
     true
 }
 
@@ -277,6 +287,7 @@ fn validate_profile(name: &str, raw: RawProfile) -> Result<Profile> {
         quarantine,
         delete_source: raw.delete_source,
         copy_quarantine: raw.copy_quarantine,
+        reflink: raw.reflink,
     })
 }
 
@@ -447,6 +458,7 @@ profiles:
             quarantine: Some("/tmp/quarantine".to_string()),
             delete_source: true,
             copy_quarantine: true,
+            reflink: true,
         };
 
         let yaml = serde_yaml_ng::to_string(&original).unwrap();
@@ -471,6 +483,7 @@ profiles:
             quarantine: None,
             delete_source: false,
             copy_quarantine: false,
+            reflink: false,
         };
 
         let yaml = serde_yaml_ng::to_string(&original).unwrap();
@@ -625,6 +638,7 @@ profiles:
             quarantine: None,
             delete_source: false,
             copy_quarantine: true,
+            reflink: true,
         };
 
         let yaml = serde_yaml_ng::to_string(&original).unwrap();
@@ -674,6 +688,52 @@ profiles:
         assert!(
             !cfg.profiles.get("cam").unwrap().copy_quarantine,
             "copy_quarantine: false must load as false"
+        );
+    }
+
+    // --- Reflink config (add-reflink-transfer, task 6.5) ---
+
+    #[test]
+    fn reflink_defaults_to_true_when_omitted() {
+        // Spec scenario: "Reflink defaults to enabled" — a profile that
+        // omits `reflink` must load with the field set to `true`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  cam:\n    type: generic\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = load(&path).unwrap();
+        assert!(
+            cfg.profiles.get("cam").unwrap().reflink,
+            "omitting reflink should default to true"
+        );
+    }
+
+    #[test]
+    fn reflink_false_loads_correctly() {
+        // Spec scenario: "Reflink can be disabled" — a profile with
+        // `reflink: false` must load with the field `false`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  cam:\n    type: generic\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n    reflink: false\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = load(&path).unwrap();
+        assert!(
+            !cfg.profiles.get("cam").unwrap().reflink,
+            "reflink: false must load as false"
         );
     }
 

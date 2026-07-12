@@ -20,3 +20,4 @@ Keep notes under a page. Link related ADRs.
 - [Making illegal states unrepresentable with enums](illegal-states-with-enums.md) — Tesla's `Reasons` allow-xor-deny enum vs. two `Option` fields, and its `#[serde(flatten)]` round-trip limit
 - [Serde view-models vs. deriving on domain types](serde-view-models-vs-domain-types.md) — `report.rs`'s `PlanJson`/`ResultsJson`, and why the JSON contract isn't derived onto `ImportPlan`/`ExecuteReport` directly
 - [A custom `tracing` writer, and `OnceLock` for shared global state](makewriter-and-global-state.md) — `cli.rs`'s `MakeWriter` impl and `progress.rs`'s `OnceLock<MultiProgress>` registry
+- [Copy-on-write reflinks](copy-on-write-reflink.md) — `FICLONE`, why it's neither a copy nor a hard link, and mirroring `std::fs::copy`'s signature for a clean fallback seam

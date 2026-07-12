@@ -18,6 +18,7 @@ Per-invocation intent is CLI-overridable, in both directions, via paired flags n
 - `copy_quarantine` — `--copy-quarantine` / `--no-copy-quarantine`
 - `quarantine` — `--quarantine PATH` (also forces `copy_quarantine` on for the run, design D4 of `add-cli-overrides`)
 - `require_marker` (GoPro only) — `--gopro-require-marker` / `--no-gopro-require-marker`
+- `reflink` — `--reflink` / `--no-reflink` (`add-reflink-transfer`; see [0013](0013-reflink-structural-verification.md))
 - `source` (pre-existing) — `--source PATH`
 
 Profile identity is not CLI-overridable: `type`, `destination`, `layout`, `ignore`, and Tesla's `events`/`reasons`. A profile with a different filter set, a different layout, or a different destination is a *different profile* — the config file, not a flag, is where that distinction belongs. Overriding these from the CLI would let one profile name mean something different from run to run, which is exactly the ambiguity naming profiles is meant to avoid.

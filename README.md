@@ -70,6 +70,7 @@ Common fields, available to every profile:
 | `quarantine`    | Where footage that doesn't meet the keep criteria goes; defaults to `{destination}/_quarantine`. Purged with `cleanup` |
 | `delete_source` | Delete source files after a verified transfer (per-run: `--delete-source`/`--no-delete-source` override in either direction) |
 | `copy_quarantine` | Copy quarantined footage to the quarantine folder (default `true`). Set to `false` to leave it on the source untouched — it is still reported as `QUARANTINE` in `scan` output, but no copy is made and no quarantine directory is created. A file left in place is never a deletion candidate, so `delete_source` cannot remove it. |
+| `reflink`       | Try a copy-on-write clone before stream-copying (default `true`; per-run: `--reflink`/`--no-reflink` override in either direction). Only takes effect when source and destination share a copy-on-write filesystem (e.g. both under one btrfs volume) — elsewhere it falls back to the normal verified copy automatically. A clone is verified by construction, not by re-hashing, and is a source-deletion candidate exactly like a stream-copied file. With `delete_source: false`, a reflinked source and its library copy share disk extents until either file is edited, at which point the filesystem transparently splits them. |
 
 Device-specific fields (only valid on their own `type`; e.g. `require_marker`
 on a non-`gopro` profile, or `events`/`reasons` on a non-`tesla` profile,
@@ -201,6 +202,9 @@ Useful flags:
   re-hashing gigabytes of video. Files accepted this way are never deletion
   candidates (ADR 0009). Recipe: `import <profile> --quick-match --no-delete-source`
   re-imports metadata and rewrites sidecars cheaply.
+- `--reflink` / `--no-reflink` — force copy-on-write cloning on or off for
+  this run (default `true`, see the `reflink` config field above). A clone
+  is verified by construction and remains a source-deletion candidate.
 
 #### Per-invocation overrides
 
@@ -217,6 +221,7 @@ passing both resolves to whichever came last:
 | `--copy-quarantine` / `--no-copy-quarantine` | `scan`, `import` | `copy_quarantine`, in either direction |
 | `--quarantine PATH`            | `scan`, `import` | The profile's quarantine directory for this run. A relative path resolves against `destination`, same as the config field. Also forces `copy_quarantine` on — combining it with `--no-copy-quarantine` is a usage error (exit 2) |
 | `--gopro-require-marker` / `--no-gopro-require-marker` | `scan`, `import` | `require_marker`, in either direction. Rejected (exit 2) on a non-`gopro` profile, with the same wording config loading uses |
+| `--reflink` / `--no-reflink`   | `import`       | `reflink`, in either direction. Only affects same-filesystem transfers; elsewhere the run already falls back to a stream copy regardless |
 
 `--quarantine` and `--copy-quarantine`/`--no-copy-quarantine` also work on
 `scan` since they change what the plan shows; `--delete-source` only

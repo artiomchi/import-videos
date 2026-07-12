@@ -22,6 +22,12 @@ const BUF_SIZE: usize = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferOutcome {
     Transferred,
+    /// The file was cloned into place with a copy-on-write reflink
+    /// rather than streamed. A successful clone shares the source's
+    /// exact extents and is therefore verified by construction, not by
+    /// a read-back hash (design D3) — it counts as content-verified and
+    /// keeps source-deletion eligibility exactly like `Transferred`.
+    Reflinked,
     SkippedIdentical,
     Suffixed(PathBuf),
     /// The file belongs to a `Quarantine` group whose profile has
@@ -83,6 +89,7 @@ fn in_place_at_destination(outcome: &TransferOutcome) -> bool {
     matches!(
         outcome,
         TransferOutcome::Transferred
+            | TransferOutcome::Reflinked
             | TransferOutcome::SkippedIdentical
             | TransferOutcome::Suffixed(_)
             | TransferOutcome::SkippedQuickMatch
@@ -97,6 +104,7 @@ fn content_verified(outcome: &TransferOutcome) -> bool {
     matches!(
         outcome,
         TransferOutcome::Transferred
+            | TransferOutcome::Reflinked
             | TransferOutcome::SkippedIdentical
             | TransferOutcome::Suffixed(_)
     )
@@ -125,6 +133,7 @@ pub fn execute(
     delete_source: bool,
     assume_yes: bool,
     quick_match: bool,
+    reflink: bool,
     progress: &Progress,
 ) -> Result<ExecuteReport> {
     // The one place we consult the ambient terminal: whether stdin is
@@ -138,6 +147,7 @@ pub fn execute(
         delete_source,
         assume_yes,
         quick_match,
+        reflink,
         io::stdin().is_terminal(),
         progress,
     )
@@ -148,6 +158,7 @@ fn execute_inner(
     delete_source: bool,
     assume_yes: bool,
     quick_match: bool,
+    reflink: bool,
     stdin_is_terminal: bool,
     progress: &Progress,
 ) -> Result<ExecuteReport> {
@@ -183,17 +194,22 @@ fn execute_inner(
                     dir,
                     media_file.recorded_at,
                     quick_match,
+                    reflink,
                     progress,
                 )?;
                 // `copy_and_hash` only ticks bytes for files it actually
                 // streams; a quick-match or identical-content skip never
                 // reaches it, even though its bytes are counted in
-                // `total_bytes` above. Without this, a re-run that skips
-                // most files would leave the bar stalled near 0% instead
-                // of reflecting real completion.
+                // `total_bytes` above. A reflinked file likewise moves no
+                // bytes through `copy_and_hash` (design D7). Without
+                // this, a re-run that skips most files — or an import
+                // that reflinks — would leave the bar stalled near 0%
+                // instead of reflecting real completion.
                 if matches!(
                     outcome,
-                    TransferOutcome::SkippedQuickMatch | TransferOutcome::SkippedIdentical
+                    TransferOutcome::SkippedQuickMatch
+                        | TransferOutcome::SkippedIdentical
+                        | TransferOutcome::Reflinked
                 ) {
                     progress.inc(media_file.size);
                 }
@@ -384,16 +400,21 @@ fn write_sidecar_inner(dir: &Path, sidecar: &Sidecar) -> Result<()> {
 /// When `quick_match` is `true` and `recorded_at` is `Some`, the fast
 /// path in `transfer_inner` may return `SkippedQuickMatch` without
 /// hashing; see design D3.
+/// When `reflink` is `true`, the copy site first attempts a
+/// copy-on-write clone of `src` into `<final>.part`; any failure falls
+/// through to the stream-copy-and-verify path unchanged (design D1-D4
+/// of add-reflink-transfer).
 pub fn transfer_file(
     src: &Path,
     dest_dir: &Path,
     recorded_at: Option<Timestamp>,
     quick_match: bool,
+    reflink: bool,
     progress: &Progress,
 ) -> Result<TransferOutcome> {
     fs::create_dir_all(dest_dir).map_err(|e| Error::io(dest_dir, e))?;
 
-    match transfer_inner(src, dest_dir, recorded_at, quick_match, progress) {
+    match transfer_inner(src, dest_dir, recorded_at, quick_match, reflink, progress) {
         Ok(outcome) => Ok(outcome),
         Err(e) => Ok(TransferOutcome::Failed(e.to_string())),
     }
@@ -404,6 +425,7 @@ fn transfer_inner(
     dest_dir: &Path,
     recorded_at: Option<Timestamp>,
     quick_match: bool,
+    reflink: bool,
     progress: &Progress,
 ) -> Result<TransferOutcome> {
     let file_name = src.file_name().ok_or_else(|| {
@@ -486,6 +508,40 @@ fn transfer_inner(
         name.push(".part");
         PathBuf::from(name)
     };
+
+    // Reflink fast path (design D1-D5 of add-reflink-transfer): try a
+    // copy-on-write clone before falling back to the stream-copy path
+    // below. The attempt itself is the probe — no `st_dev` pre-check —
+    // so any failure (cross-device, non-CoW filesystem, or any other
+    // I/O error) simply falls through unchanged (design D2). A
+    // successful clone shares the source's exact extents and is
+    // byte-identical by construction, so it skips the read-back hash
+    // entirely (design D3).
+    if reflink {
+        // The strict `reflink()` expects the target not to exist, so a
+        // stale `.part` from a previous aborted run must be cleared
+        // first (design D5) — the stream-copy path tolerates this via
+        // `File::create`'s truncate, but a clone would otherwise fail
+        // with `AlreadyExists` even when cloning is available.
+        let _ = fs::remove_file(&part_path);
+        match reflink_copy::reflink(src, &part_path) {
+            Ok(()) => {
+                fs::rename(&part_path, &final_path).map_err(|e| Error::io(&final_path, e))?;
+                if let Some(recorded_at) = recorded_at {
+                    stamp_mtime(&final_path, recorded_at);
+                }
+                return Ok(TransferOutcome::Reflinked);
+            }
+            Err(error) => {
+                tracing::debug!(
+                    file = %src.display(),
+                    %error,
+                    "reflink unavailable, falling back to stream copy"
+                );
+                let _ = fs::remove_file(&part_path);
+            }
+        }
+    }
 
     let stream_hash = match copy_and_hash(src, &part_path, progress) {
         Ok(hash) => hash,
@@ -666,6 +722,20 @@ mod tests {
         jiff::Timestamp::from_second(secs).unwrap()
     }
 
+    /// True when a plain-file reflink clone actually succeeds inside
+    /// `dir` — used to runtime-skip the reflink success-path tests on a
+    /// non-CoW filesystem (tmpfs/ext4 CI runners) rather than silently
+    /// never running them (design Open Questions, task 6.3).
+    fn cow_supported(dir: &Path) -> bool {
+        let src = dir.join("__cow_probe_src");
+        let dst = dir.join("__cow_probe_dst");
+        fs::write(&src, b"probe").unwrap();
+        let supported = reflink_copy::reflink(&src, &dst).is_ok();
+        let _ = fs::remove_file(&src);
+        let _ = fs::remove_file(&dst);
+        supported
+    }
+
     fn group_with_sidecar(path: &Path, sidecar: Sidecar) -> MediaGroup {
         MediaGroup {
             name: "session".to_string(),
@@ -740,7 +810,8 @@ mod tests {
             }],
         };
 
-        let report = execute_inner(&plan, true, false, false, false, &Progress::hidden()).unwrap();
+        let report =
+            execute_inner(&plan, true, false, false, false, false, &Progress::hidden()).unwrap();
 
         assert!(src.exists(), "deletion must be skipped, not assumed");
         assert!(!report.groups[0].deleted_from_source);
@@ -754,7 +825,8 @@ mod tests {
         fs::write(&src, b"hello").unwrap();
         let dest_dir = dir.path().join("dest");
 
-        let outcome = transfer_file(&src, &dest_dir, None, false, &Progress::hidden()).unwrap();
+        let outcome =
+            transfer_file(&src, &dest_dir, None, false, false, &Progress::hidden()).unwrap();
         assert_eq!(outcome, TransferOutcome::Transferred);
         assert_eq!(fs::read(dest_dir.join("clip.mp4")).unwrap(), b"hello");
         assert!(src.exists(), "transfer never deletes the source");
@@ -793,7 +865,7 @@ mod tests {
         };
 
         let progress = Progress::hidden();
-        let report = execute(&plan, false, false, false, &progress).unwrap();
+        let report = execute(&plan, false, false, false, false, &progress).unwrap();
         assert!(matches!(
             report.groups[0].files[0].outcome,
             TransferOutcome::Transferred
@@ -848,7 +920,8 @@ mod tests {
             }],
         };
 
-        let report = execute_inner(&plan, true, true, false, false, &Progress::hidden()).unwrap();
+        let report =
+            execute_inner(&plan, true, true, false, false, false, &Progress::hidden()).unwrap();
 
         let dest_path = dest_dir.join("clip.mp4");
         assert_eq!(fs::read(&dest_path).unwrap(), b"hello world");
@@ -876,7 +949,8 @@ mod tests {
         fs::create_dir_all(&dest_dir).unwrap();
         fs::write(dest_dir.join("clip.mp4"), b"hello").unwrap();
 
-        let outcome = transfer_file(&src, &dest_dir, None, false, &Progress::hidden()).unwrap();
+        let outcome =
+            transfer_file(&src, &dest_dir, None, false, false, &Progress::hidden()).unwrap();
         assert_eq!(outcome, TransferOutcome::SkippedIdentical);
     }
 
@@ -894,6 +968,7 @@ mod tests {
             &src,
             &dest_dir,
             Some(recorded_at),
+            false,
             false,
             &Progress::hidden(),
         )
@@ -943,7 +1018,7 @@ mod tests {
             }],
         };
 
-        execute(&plan, false, false, false, &Progress::hidden()).unwrap();
+        execute(&plan, false, false, false, false, &Progress::hidden()).unwrap();
 
         let mtime = fs::metadata(quarantine_dir.join("clip.mp4"))
             .unwrap()
@@ -979,6 +1054,7 @@ mod tests {
             &dest_dir,
             Some(recorded_at),
             false,
+            false,
             &Progress::hidden(),
         )
         .unwrap();
@@ -998,7 +1074,8 @@ mod tests {
         fs::write(&src, b"hello").unwrap();
         let dest_dir = dir.path().join("dest");
 
-        let outcome = transfer_file(&src, &dest_dir, None, false, &Progress::hidden()).unwrap();
+        let outcome =
+            transfer_file(&src, &dest_dir, None, false, false, &Progress::hidden()).unwrap();
         assert_eq!(outcome, TransferOutcome::Transferred);
         // No panic and a normal outcome is the whole point here: with
         // `recorded_at: None`, `transfer_inner` never calls
@@ -1036,7 +1113,7 @@ mod tests {
             }],
         };
 
-        let report = execute(&plan, false, false, false, &Progress::hidden()).unwrap();
+        let report = execute(&plan, false, false, false, false, &Progress::hidden()).unwrap();
 
         assert!(matches!(
             report.groups[0].sidecar_outcome,
@@ -1069,7 +1146,7 @@ mod tests {
             }],
         };
 
-        let report = execute(&plan, true, true, false, &Progress::hidden()).unwrap();
+        let report = execute(&plan, true, true, false, false, &Progress::hidden()).unwrap();
 
         assert!(matches!(
             report.groups[0].sidecar_outcome,
@@ -1136,7 +1213,8 @@ mod tests {
         fs::create_dir_all(&dest_dir).unwrap();
         fs::write(dest_dir.join("clip.mp4"), b"old-bytes").unwrap();
 
-        let outcome = transfer_file(&src, &dest_dir, None, false, &Progress::hidden()).unwrap();
+        let outcome =
+            transfer_file(&src, &dest_dir, None, false, false, &Progress::hidden()).unwrap();
         let TransferOutcome::Suffixed(path) = outcome else {
             panic!("expected Suffixed, got different outcome");
         };
@@ -1189,7 +1267,7 @@ mod tests {
         };
 
         let progress = Progress::new(true, "Importing");
-        let report = execute(&plan, false, false, false, &progress).unwrap();
+        let report = execute(&plan, false, false, false, false, &progress).unwrap();
         assert!(matches!(
             report.groups[0].files[0].outcome,
             TransferOutcome::SkippedIdentical
@@ -1239,10 +1317,205 @@ mod tests {
         };
 
         let progress = Progress::new(true, "Importing");
-        let report = execute(&plan, false, false, true, &progress).unwrap();
+        let report = execute(&plan, false, false, true, false, &progress).unwrap();
         assert!(matches!(
             report.groups[0].files[0].outcome,
             TransferOutcome::SkippedQuickMatch
+        ));
+        assert_eq!(progress.position(), content.len() as u64);
+    }
+
+    // --- reflink fast path (add-reflink-transfer) ---
+
+    #[test]
+    fn reflink_falls_back_to_stream_copy_when_unavailable() {
+        // Spec: "Cross-device transfer falls back to verified copy"
+        // (task 6.1). A default tempdir sits on a non-CoW filesystem on
+        // every machine this crate's tests are expected to run on
+        // (tmpfs/ext4), so a real reflink attempt here fails
+        // deterministically and the engine must fall through to the
+        // ordinary stream-copy-and-verify path with no visible
+        // difference to the caller. Skipped, rather than false-failed,
+        // on the rare CoW-everywhere box where it can't be exercised.
+        let dir = tempfile::tempdir().unwrap();
+        if cow_supported(dir.path()) {
+            eprintln!(
+                "skipping: filesystem supports reflink, cannot exercise the deterministic fallback path here"
+            );
+            return;
+        }
+
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello world").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let outcome =
+            transfer_file(&src, &dest_dir, None, false, true, &Progress::hidden()).unwrap();
+
+        assert_eq!(outcome, TransferOutcome::Transferred);
+        assert_eq!(fs::read(dest_dir.join("clip.mp4")).unwrap(), b"hello world");
+        assert!(src.exists(), "fallback must never touch the source");
+        assert!(!dest_dir.join("clip.mp4.part").exists());
+    }
+
+    #[test]
+    fn reflink_disabled_never_attempts_a_clone() {
+        // Spec: "Reflink disabled always stream-copies" / "Reflink
+        // override forces cloning off" (task 6.2). Unlike the fallback
+        // test above, this must hold regardless of the underlying
+        // filesystem's CoW support: `reflink: false` short-circuits the
+        // attempt entirely.
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello world").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let outcome =
+            transfer_file(&src, &dest_dir, None, false, false, &Progress::hidden()).unwrap();
+
+        assert_eq!(outcome, TransferOutcome::Transferred);
+        assert_eq!(fs::read(dest_dir.join("clip.mp4")).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn reflink_success_path_clones_when_cow_available() {
+        // Spec: "Same-filesystem transfer is reflinked without hashing"
+        // (task 6.3). Runtime-detects CoW support and skips otherwise
+        // (design Open Questions) rather than assuming the test
+        // environment can exercise it.
+        let dir = tempfile::tempdir().unwrap();
+        if !cow_supported(dir.path()) {
+            eprintln!("skipping: filesystem does not support reflink/CoW");
+            return;
+        }
+
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello world").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let recorded_at: Timestamp = "2026-07-09T07:41:03Z".parse().unwrap();
+        let outcome = transfer_file(
+            &src,
+            &dest_dir,
+            Some(recorded_at),
+            false,
+            true,
+            &Progress::hidden(),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, TransferOutcome::Reflinked);
+        let dest_path = dest_dir.join("clip.mp4");
+        assert_eq!(fs::read(&dest_path).unwrap(), b"hello world");
+        assert!(!dest_dir.join("clip.mp4.part").exists());
+        let mtime = fs::metadata(&dest_path).unwrap().modified().unwrap();
+        assert_eq!(Timestamp::try_from(mtime).unwrap(), recorded_at);
+
+        // Independent inode (design D6): a reflink clone is a distinct
+        // inode sharing extents copy-on-write, so mutating the
+        // destination must never affect the source — unlike a hard
+        // link, which shares one inode under two names.
+        fs::write(&dest_path, b"mutated").unwrap();
+        assert_eq!(fs::read(&src).unwrap(), b"hello world");
+    }
+
+    #[test]
+    fn reflinked_group_is_deletion_eligible() {
+        // Spec: "Reflinked files are deletion candidates" (task 6.4) —
+        // a successful clone is verified by construction (design D3),
+        // so it must make its group a source-deletion candidate exactly
+        // as a stream-copied-and-verified file does. Runtime-skipped
+        // like 6.3 when CoW is unavailable.
+        let dir = tempfile::tempdir().unwrap();
+        if !cow_supported(dir.path()) {
+            eprintln!("skipping: filesystem does not support reflink/CoW");
+            return;
+        }
+
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello world").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let group = MediaGroup {
+            name: "session".to_string(),
+            files: vec![MediaFile {
+                path: src.clone(),
+                size: 11,
+                recorded_at: None,
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group,
+                verdict: Verdict::Keep,
+                destination: Some(dest_dir.clone()),
+                quarantine_path: None,
+            }],
+        };
+
+        let report =
+            execute_inner(&plan, true, true, false, true, false, &Progress::hidden()).unwrap();
+
+        assert!(matches!(
+            report.groups[0].files[0].outcome,
+            TransferOutcome::Reflinked
+        ));
+        assert!(
+            report.groups[0].deleted_from_source,
+            "a reflinked group must be deletion-eligible: verified by construction"
+        );
+        assert!(!src.exists(), "source should be deleted once cloned");
+    }
+
+    #[test]
+    fn reflinked_outcome_advances_progress_by_full_size() {
+        // Companion to `skipped_identical_still_advances_progress_by_full_size`
+        // (design D7, task 3.5): a reflink moves no bytes through
+        // `copy_and_hash`, so `execute_inner` must tick the bar itself
+        // or a reflink-heavy run would leave it stalled near 0%.
+        let dir = tempfile::tempdir().unwrap();
+        if !cow_supported(dir.path()) {
+            eprintln!("skipping: filesystem does not support reflink/CoW");
+            return;
+        }
+
+        let src = dir.path().join("clip.mp4");
+        let content = b"hello world";
+        fs::write(&src, content).unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let group = MediaGroup {
+            name: "a".to_string(),
+            files: vec![MediaFile {
+                path: src.clone(),
+                size: content.len() as u64,
+                recorded_at: None,
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group,
+                verdict: Verdict::Keep,
+                destination: Some(dest_dir.clone()),
+                quarantine_path: None,
+            }],
+        };
+
+        let progress = Progress::new(true, "Importing");
+        let report = execute(&plan, false, false, false, true, &progress).unwrap();
+        assert!(matches!(
+            report.groups[0].files[0].outcome,
+            TransferOutcome::Reflinked
         ));
         assert_eq!(progress.position(), content.len() as u64);
     }

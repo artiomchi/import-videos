@@ -165,6 +165,7 @@ mod tests {
             quarantine: None,
             delete_source: false,
             copy_quarantine,
+            reflink: true,
         }
     }
 
