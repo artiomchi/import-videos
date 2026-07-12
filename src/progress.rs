@@ -85,6 +85,12 @@ impl Progress {
                 .progress_chars("#>-"),
         );
         bar.set_prefix(label.to_string());
+        // Redraw on a background cadence so the spinner and elapsed
+        // timer keep animating even across long stretches with no
+        // `inc` — notably the clash-detection and read-back hashes,
+        // which read whole files without ticking any bytes. Without
+        // this the bar looks hung during verification.
+        bar.enable_steady_tick(std::time::Duration::from_millis(100));
         Self::wrap(Some(bar))
     }
 

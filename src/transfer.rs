@@ -233,6 +233,12 @@ fn execute_inner(
         });
     }
 
+    // Every transfer is done, so clear the bar — and, crucially, stop
+    // its steady-tick thread — before any confirmation prompt. Left
+    // running, that background redraw repaints the bar over the
+    // `[y/N]` prompt and the user's keystrokes.
+    progress.finish();
+
     let mut deletion_skipped_reason = None;
     if delete_source {
         let any_eligible = groups.iter().any(|g| {
@@ -278,8 +284,6 @@ fn execute_inner(
             }
         }
     }
-
-    progress.finish();
 
     Ok(ExecuteReport {
         groups,
@@ -458,6 +462,13 @@ fn transfer_inner(
     // entirely.
     let dest_candidate = dest_dir.join(file_name);
     let (final_path, suffixed) = if dest_candidate.exists() {
+        // The name is taken, so we hash the source (a full read off the
+        // slow source medium) to tell an already-imported file from a
+        // genuine collision. That read ticks no bytes — the copy phase
+        // owns the byte budget — so announce the phase explicitly;
+        // otherwise the bar sits under a stale "copying" message with
+        // no visible movement while a multi-GB clip is hashed.
+        progress.set_message(format!("checking {}", file_name.to_string_lossy()));
         let src_hash = hash_file(src)?;
         match resolve_destination(dest_dir, file_name, &src_hash)? {
             None => return Ok(TransferOutcome::SkippedIdentical),
