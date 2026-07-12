@@ -175,15 +175,7 @@ fn execution_follows_the_plan() {
     )
     .unwrap();
 
-    let report = transfer::execute(
-        &import_plan,
-        false,
-        false,
-        false,
-        false,
-        &Progress::hidden(),
-    )
-    .unwrap();
+    let report = transfer::execute(&import_plan, false, false, false, &Progress::hidden()).unwrap();
 
     assert_eq!(
         fs::read(dest.join("1970/1970-01-01/keep.mp4")).unwrap(),
@@ -245,15 +237,7 @@ fn transfer_failure_keeps_source_and_does_not_block_other_groups() {
         ],
     };
 
-    let report = transfer::execute(
-        &import_plan,
-        false,
-        false,
-        false,
-        false,
-        &Progress::hidden(),
-    )
-    .unwrap();
+    let report = transfer::execute(&import_plan, false, false, false, &Progress::hidden()).unwrap();
 
     let ok_group = report.groups.iter().find(|g| g.group_name == "ok").unwrap();
     assert!(matches!(
@@ -320,15 +304,7 @@ fn rerunning_import_is_idempotent() {
         .unwrap()
     };
 
-    let first = transfer::execute(
-        &make_plan(),
-        false,
-        false,
-        false,
-        false,
-        &Progress::hidden(),
-    )
-    .unwrap();
+    let first = transfer::execute(&make_plan(), false, false, false, &Progress::hidden()).unwrap();
     assert!(matches!(
         first.groups[0].files[0].outcome,
         TransferOutcome::Transferred
@@ -336,15 +312,7 @@ fn rerunning_import_is_idempotent() {
 
     let dest_snapshot = tree_snapshot(&dest);
 
-    let second = transfer::execute(
-        &make_plan(),
-        false,
-        false,
-        false,
-        false,
-        &Progress::hidden(),
-    )
-    .unwrap();
+    let second = transfer::execute(&make_plan(), false, false, false, &Progress::hidden()).unwrap();
     assert!(matches!(
         second.groups[0].files[0].outcome,
         TransferOutcome::SkippedIdentical
@@ -379,15 +347,7 @@ fn different_content_at_destination_gets_suffixed() {
     )
     .unwrap();
 
-    let report = transfer::execute(
-        &import_plan,
-        false,
-        false,
-        false,
-        false,
-        &Progress::hidden(),
-    )
-    .unwrap();
+    let report = transfer::execute(&import_plan, false, false, false, &Progress::hidden()).unwrap();
 
     assert!(matches!(
         report.groups[0].files[0].outcome,
@@ -395,42 +355,6 @@ fn different_content_at_destination_gets_suffixed() {
     ));
     assert_eq!(fs::read(dest.join("clip.mp4")).unwrap(), b"old bytes");
     assert_eq!(fs::read(dest.join("clip-1.mp4")).unwrap(), b"new bytes");
-}
-
-// --- keep-source overrides delete_source for the run ---
-
-#[test]
-fn keep_source_flag_overrides_delete_source() {
-    let dir = tempfile::tempdir().unwrap();
-    let src = dir.path().join("source/clip.mp4");
-    write_file(&src, b"footage");
-    let dest = dir.path().join("dest");
-
-    let source_impl = TestSource {
-        groups: vec![(group("a", vec![media_file(&src)]), Verdict::Keep)],
-    };
-    let prof = profile(&dest, None, true); // delete_source: true
-    let import_plan = plan::build_plan(
-        &prof,
-        &source_impl,
-        Path::new("/ignored"),
-        &jiff::tz::TimeZone::UTC,
-        &Progress::hidden(),
-    )
-    .unwrap();
-
-    // keep_source = true overrides the profile for this run.
-    transfer::execute(
-        &import_plan,
-        prof.delete_source,
-        true,
-        true,
-        false,
-        &Progress::hidden(),
-    )
-    .unwrap();
-
-    assert!(src.exists(), "--keep-source must prevent source deletion");
 }
 
 // --- Clean card after successful import (delete_source honored) ---
@@ -455,8 +379,7 @@ fn delete_source_removes_file_after_confirmed_transfer() {
     )
     .unwrap();
 
-    let report =
-        transfer::execute(&import_plan, true, false, true, false, &Progress::hidden()).unwrap();
+    let report = transfer::execute(&import_plan, true, true, false, &Progress::hidden()).unwrap();
 
     assert!(report.groups[0].deleted_from_source);
     assert!(!src.exists());
@@ -609,15 +532,7 @@ fn disabled_quarantine_copy_leaves_source_and_creates_no_dir() {
         &Progress::hidden(),
     )
     .unwrap();
-    let report = transfer::execute(
-        &import_plan,
-        false,
-        false,
-        false,
-        false,
-        &Progress::hidden(),
-    )
-    .unwrap();
+    let report = transfer::execute(&import_plan, false, false, false, &Progress::hidden()).unwrap();
 
     // Source must be untouched.
     assert!(
@@ -686,8 +601,7 @@ fn disabled_quarantine_copy_source_not_deleted_even_with_delete_source() {
     )
     .unwrap();
     // assume_yes = true to skip the interactive prompt.
-    let report =
-        transfer::execute(&import_plan, true, false, true, false, &Progress::hidden()).unwrap();
+    let report = transfer::execute(&import_plan, true, true, false, &Progress::hidden()).unwrap();
 
     // The Keep group's source is deleted after a verified transfer.
     assert!(
@@ -776,8 +690,7 @@ fn quick_match_hit_skips_hashing_and_reports_distinct_outcome() {
     )
     .unwrap();
 
-    let report =
-        transfer::execute(&import_plan, false, false, false, true, &Progress::hidden()).unwrap();
+    let report = transfer::execute(&import_plan, false, false, true, &Progress::hidden()).unwrap();
 
     assert_eq!(
         report.groups[0].files[0].outcome,
@@ -819,8 +732,7 @@ fn quick_match_miss_on_size_difference_falls_through_to_verified_transfer() {
     )
     .unwrap();
 
-    let report =
-        transfer::execute(&import_plan, false, false, false, true, &Progress::hidden()).unwrap();
+    let report = transfer::execute(&import_plan, false, false, true, &Progress::hidden()).unwrap();
 
     // Size mismatch → miss → falls through to full verified transfer; content
     // differs from destination, so it gets suffixed.
@@ -866,8 +778,7 @@ fn fully_quick_matched_group_is_never_deleted_even_with_delete_source_and_yes() 
     .unwrap();
 
     // delete_source=true, assume_yes=true, quick_match=true
-    let report =
-        transfer::execute(&import_plan, true, false, true, true, &Progress::hidden()).unwrap();
+    let report = transfer::execute(&import_plan, true, true, true, &Progress::hidden()).unwrap();
 
     // The group must be SkippedQuickMatch (not content-verified).
     assert_eq!(

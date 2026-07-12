@@ -16,7 +16,7 @@ Add a `--quick-match` flag to `import`. When set, `transfer_inner` checks the ca
 
 `SkippedQuickMatch` is deliberately **excluded from the source-deletion gate**. The content was not verified, so the safety invariant from ADR 0003 is preserved: only `content_verified` outcomes (`Transferred`, `SkippedIdentical`, `Suffixed`) unlock source deletion.
 
-A `SkippedQuickMatch` file is still counted as "in place at the destination" for sidecar-writing purposes, so `import --quick-match --keep-source` becomes a cheap sidecar-regeneration recipe: the sidecar is rebuilt from source metadata (MP4 atoms, telemetry, `event.json`) and rewritten, while video files are matched without re-hashing.
+A `SkippedQuickMatch` file is still counted as "in place at the destination" for sidecar-writing purposes, so `import --quick-match --no-delete-source` becomes a cheap sidecar-regeneration recipe: the sidecar is rebuilt from source metadata (MP4 atoms, telemetry, `event.json`) and rewritten, while video files are matched without re-hashing.
 
 ## Consequences
 

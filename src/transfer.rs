@@ -101,13 +101,16 @@ fn sidecar_ok(outcome: &Option<TransferOutcome>) -> bool {
 /// destination and `Quarantine` groups to their quarantine path
 /// (identical safety mechanism, different target directory); `Ignore`
 /// groups are left untouched. Source deletion — gated on
-/// `delete_source`, `keep_source`, and a confirmation prompt — only
-/// ever considers groups whose files all transferred or were confirmed
+/// `delete_source` and a confirmation prompt — only ever considers
+/// groups whose files all transferred or were confirmed
 /// already-imported (spec: "Source deletion only after verification").
+/// `delete_source` is the effective value: the caller has already
+/// folded in any `--delete-source`/`--no-delete-source` override at
+/// profile resolution (design D5), so this function stays
+/// override-unaware.
 pub fn execute(
     plan: &ImportPlan,
     delete_source: bool,
-    keep_source: bool,
     assume_yes: bool,
     quick_match: bool,
     progress: &Progress,
@@ -121,7 +124,6 @@ pub fn execute(
     execute_inner(
         plan,
         delete_source,
-        keep_source,
         assume_yes,
         quick_match,
         io::stdin().is_terminal(),
@@ -132,7 +134,6 @@ pub fn execute(
 fn execute_inner(
     plan: &ImportPlan,
     delete_source: bool,
-    keep_source: bool,
     assume_yes: bool,
     quick_match: bool,
     stdin_is_terminal: bool,
@@ -220,7 +221,7 @@ fn execute_inner(
     }
 
     let mut deletion_skipped_reason = None;
-    if delete_source && !keep_source {
+    if delete_source {
         let any_eligible = groups.iter().any(|g| {
             !g.files.is_empty()
                 && g.files.iter().all(|f| content_verified(&f.outcome))
@@ -623,8 +624,7 @@ mod tests {
             }],
         };
 
-        let report =
-            execute_inner(&plan, true, false, false, false, false, &Progress::hidden()).unwrap();
+        let report = execute_inner(&plan, true, false, false, false, &Progress::hidden()).unwrap();
 
         assert!(src.exists(), "deletion must be skipped, not assumed");
         assert!(!report.groups[0].deleted_from_source);
@@ -721,7 +721,7 @@ mod tests {
             }],
         };
 
-        execute(&plan, false, false, false, false, &Progress::hidden()).unwrap();
+        execute(&plan, false, false, false, &Progress::hidden()).unwrap();
 
         let mtime = fs::metadata(quarantine_dir.join("clip.mp4"))
             .unwrap()
@@ -814,7 +814,7 @@ mod tests {
             }],
         };
 
-        let report = execute(&plan, false, false, false, false, &Progress::hidden()).unwrap();
+        let report = execute(&plan, false, false, false, &Progress::hidden()).unwrap();
 
         assert!(matches!(
             report.groups[0].sidecar_outcome,
@@ -847,7 +847,7 @@ mod tests {
             }],
         };
 
-        let report = execute(&plan, true, false, true, false, &Progress::hidden()).unwrap();
+        let report = execute(&plan, true, true, false, &Progress::hidden()).unwrap();
 
         assert!(matches!(
             report.groups[0].sidecar_outcome,
@@ -922,7 +922,7 @@ mod tests {
         };
 
         let progress = Progress::new(true);
-        let report = execute(&plan, false, false, false, false, &progress).unwrap();
+        let report = execute(&plan, false, false, false, &progress).unwrap();
         assert!(matches!(
             report.groups[0].files[0].outcome,
             TransferOutcome::SkippedIdentical
@@ -972,7 +972,7 @@ mod tests {
         };
 
         let progress = Progress::new(true);
-        let report = execute(&plan, false, false, false, true, &progress).unwrap();
+        let report = execute(&plan, false, false, true, &progress).unwrap();
         assert!(matches!(
             report.groups[0].files[0].outcome,
             TransferOutcome::SkippedQuickMatch

@@ -68,7 +68,7 @@ Common fields, available to every profile:
 | `timezone`      | IANA timezone name for `{date:...}` layout fields and mtime stamping (e.g. `Europe/Vilnius`); defaults to the system timezone |
 | `ignore`        | Glob patterns for files to skip entirely                         |
 | `quarantine`    | Where footage that doesn't meet the keep criteria goes; defaults to `{destination}/_quarantine`. Purged with `cleanup` |
-| `delete_source` | Delete source files after a verified transfer (per-run: `--keep-source` overrides) |
+| `delete_source` | Delete source files after a verified transfer (per-run: `--delete-source`/`--no-delete-source` override in either direction) |
 | `copy_quarantine` | Copy quarantined footage to the quarantine folder (default `true`). Set to `false` to leave it on the source untouched — it is still reported as `QUARANTINE` in `scan` output, but no copy is made and no quarantine directory is created. A file left in place is never a deletion candidate, so `delete_source` cannot remove it. |
 
 Device-specific fields (only valid on their own `type`; e.g. `require_marker`
@@ -194,14 +194,34 @@ Useful flags:
 
 - `--source PATH` — use this path instead of the profile's configured source
 - `--dry-run` — print the plan and stop (same as `scan`, but via `import`)
-- `--keep-source` — never delete source files, even if the profile requests it
 - `--yes` — skip the confirmation prompt before deleting source files
 - `--quick-match` — skip content hashing when the destination file's name,
   size, and mtime match within 0.1 s of the source's recording time. Useful
   for regenerating `import.json` on already-imported footage without
   re-hashing gigabytes of video. Files accepted this way are never deletion
-  candidates (ADR 0009). Recipe: `import <profile> --quick-match --keep-source`
+  candidates (ADR 0009). Recipe: `import <profile> --quick-match --no-delete-source`
   re-imports metadata and rewrites sidecars cheaply.
+
+#### Per-invocation overrides
+
+Every profile setting that expresses per-invocation intent, rather than
+profile identity, can be overridden for a single run without touching the
+config file (see [ADR 0011](docs/adr/0011-cli-overridability-policy.md) for
+the line between the two). Boolean
+overrides are paired flags — passing neither uses the profile's value;
+passing both resolves to whichever came last:
+
+| Flag                          | Subcommands    | Overrides                                                                 |
+| ------------------------------ | -------------- | -------------------------------------------------------------------------- |
+| `--delete-source` / `--no-delete-source` | `import`       | `delete_source`, in either direction. Forcing deletion on still requires confirmation (`--yes` or the prompt); quick-matched files are still never deletion candidates. `--keep-source` is a hidden alias of `--no-delete-source`, kept for old scripts and muscle memory. |
+| `--copy-quarantine` / `--no-copy-quarantine` | `scan`, `import` | `copy_quarantine`, in either direction |
+| `--quarantine PATH`            | `scan`, `import` | The profile's quarantine directory for this run. A relative path resolves against `destination`, same as the config field. Also forces `copy_quarantine` on — combining it with `--no-copy-quarantine` is a usage error (exit 2) |
+| `--gopro-require-marker` / `--no-gopro-require-marker` | `scan`, `import` | `require_marker`, in either direction. Rejected (exit 2) on a non-`gopro` profile, with the same wording config loading uses |
+
+`--quarantine` and `--copy-quarantine`/`--no-copy-quarantine` also work on
+`scan` since they change what the plan shows; `--delete-source` only
+affects execution, so it's `import`-only. Overrides apply before planning,
+so `scan`, `import --dry-run`, and `import` all reflect them identically.
 
 ### `cleanup`
 

@@ -47,25 +47,34 @@ fn run_inner(cli: Cli) -> Result<ExitCode> {
     let json = cli.json;
 
     match cli.command {
-        Command::Scan { profile, source } => {
+        Command::Scan {
+            profile,
+            source,
+            overrides,
+        } => {
             let cfg = load_config(cli.config.as_deref())?;
-            run_scan(&cfg, &profile, source.as_deref(), verbose, json)
+            let overrides = overrides.to_overrides();
+            run_scan(&cfg, &profile, source.as_deref(), &overrides, verbose, json)
         }
         Command::Import {
             profile,
             source,
             dry_run,
-            keep_source,
+            delete_source,
+            no_delete_source,
             yes,
             quick_match,
+            overrides,
         } => {
             let cfg = load_config(cli.config.as_deref())?;
+            let mut overrides = overrides.to_overrides();
+            overrides.delete_source = cli::override_pair(delete_source, no_delete_source);
             run_import(
                 &cfg,
                 &profile,
                 source.as_deref(),
                 dry_run,
-                keep_source,
+                &overrides,
                 yes,
                 quick_match,
                 verbose,
@@ -100,19 +109,86 @@ fn get_profile<'a>(cfg: &'a config::Config, name: &str) -> Result<&'a config::Pr
         .ok_or_else(|| Error::Config(format!("unknown profile '{name}'")))
 }
 
-/// Resolves a source and builds a plan for `profile_name`, handling the
-/// two "nothing to do" cases (`scan` and `import` share this exactly:
-/// spec requires `import` build "the same plan `scan` would"). `scan_progress`
-/// reports the scan phase's progress (add-scan-progress design D1, D4) — its
-/// enabled/hidden state is decided once by the caller, never re-derived here.
+/// Resolves `profile_name` and applies its per-invocation `Overrides`
+/// (design D5), producing the effective `Profile` that planning and
+/// execution consume unaware overrides exist (task 2.4). Overrides are
+/// applied once, here, so `scan`, `--dry-run`, and `import` always see
+/// the same result (spec: "Overrides SHALL be applied when the profile
+/// is resolved, before planning").
+fn resolve_profile(
+    cfg: &config::Config,
+    profile_name: &str,
+    overrides: &cli::Overrides,
+) -> Result<config::Profile> {
+    let profile = get_profile(cfg, profile_name)?;
+    apply_overrides(profile, overrides, profile_name)
+}
+
+/// Clones `profile` and shadows each field with a `Some` override
+/// (design D5). `--quarantine` forces `copy_quarantine` on even when
+/// `--no-copy-quarantine` wasn't passed (design D4; the contradictory
+/// combination is already rejected at parse time by clap's
+/// `conflicts_with`). A marker override against a non-GoPro profile
+/// fails with the same wording `config::load` uses, so scripts see one
+/// consistent error regardless of whether the mistake is in the YAML or
+/// on the command line.
+fn apply_overrides(
+    profile: &config::Profile,
+    overrides: &cli::Overrides,
+    profile_name: &str,
+) -> Result<config::Profile> {
+    let mut profile = profile.clone();
+
+    if let Some(delete_source) = overrides.delete_source {
+        profile.delete_source = delete_source;
+    }
+
+    if let Some(copy_quarantine) = overrides.copy_quarantine {
+        profile.copy_quarantine = copy_quarantine;
+    }
+    if overrides.quarantine.is_some() {
+        profile.copy_quarantine = true;
+    }
+
+    if let Some(path) = &overrides.quarantine {
+        let path = if path.is_absolute() {
+            path.clone()
+        } else {
+            profile.destination.join(path)
+        };
+        profile.quarantine = Some(path);
+    }
+
+    if let Some(require_marker) = overrides.gopro_require_marker {
+        match &mut profile.kind {
+            config::SourceKind::Gopro {
+                require_marker: field,
+            } => *field = require_marker,
+            _ => {
+                return Err(Error::Config(format!(
+                    "profile '{profile_name}': require_marker is only valid for profiles of type gopro"
+                )));
+            }
+        }
+    }
+
+    Ok(profile)
+}
+
+/// Resolves a source and builds a plan for the already-resolved
+/// `profile` (overrides applied — task 2.4, plan/transfer/report stay
+/// override-unaware), handling the two "nothing to do" cases (`scan`
+/// and `import` share this exactly: spec requires `import` build "the
+/// same plan `scan` would"). `scan_progress` reports the scan phase's
+/// progress (add-scan-progress design D1, D4) — its enabled/hidden
+/// state is decided once by the caller, never re-derived here.
 /// `Ok(None)` means the caller should report "nothing found" and stop.
 fn scan_profile(
     cfg: &config::Config,
-    profile_name: &str,
+    profile: &config::Profile,
     source_override: Option<&Path>,
     scan_progress: &progress::Progress,
 ) -> Result<Option<plan::ImportPlan>> {
-    let profile = get_profile(cfg, profile_name)?;
     let source_impl = profile.kind.build();
 
     let Some(root) = plan::resolve_source(
@@ -179,11 +255,13 @@ fn run_scan(
     cfg: &config::Config,
     profile_name: &str,
     source_override: Option<&Path>,
+    overrides: &cli::Overrides,
     verbose: bool,
     json: bool,
 ) -> Result<ExitCode> {
+    let profile = resolve_profile(cfg, profile_name, overrides)?;
     let scan_progress = progress::Progress::counted(scan_progress_enabled(json));
-    match scan_profile(cfg, profile_name, source_override, &scan_progress)? {
+    match scan_profile(cfg, &profile, source_override, &scan_progress)? {
         None => print_no_sources(profile_name, json),
         Some(import_plan) => print_plan(&import_plan, verbose, &cfg.timezone, json),
     }
@@ -196,17 +274,16 @@ fn run_import(
     profile_name: &str,
     source_override: Option<&Path>,
     dry_run: bool,
-    keep_source_flag: bool,
+    overrides: &cli::Overrides,
     assume_yes: bool,
     quick_match: bool,
     verbose: bool,
     json: bool,
 ) -> Result<ExitCode> {
-    let profile = get_profile(cfg, profile_name)?;
+    let profile = resolve_profile(cfg, profile_name, overrides)?;
 
     let scan_progress = progress::Progress::counted(scan_progress_enabled(json));
-    let Some(import_plan) = scan_profile(cfg, profile_name, source_override, &scan_progress)?
-    else {
+    let Some(import_plan) = scan_profile(cfg, &profile, source_override, &scan_progress)? else {
         print_no_sources(profile_name, json);
         return Ok(ExitCode::Success);
     };
@@ -224,7 +301,6 @@ fn run_import(
     let exec_report = transfer::execute(
         &import_plan,
         profile.delete_source,
-        keep_source_flag,
         assume_yes,
         quick_match,
         &progress,
