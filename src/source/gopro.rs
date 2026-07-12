@@ -400,6 +400,7 @@ fn derive_session_offset(
         progress.set_message(format!("session {session_id}: {}", file_name(path)));
 
         let Some(chapter_telemetry) = telemetry[i].as_mut() else {
+            tracing::debug!(file = %path.display(), "no telemetry track; chapter untelemetered");
             continue;
         };
         let fix = match chapter_telemetry.first_good_fix() {
@@ -414,14 +415,21 @@ fn derive_session_offset(
             }
         };
         let Some((sample, payload)) = fix else {
+            tracing::debug!(file = %path.display(), "no usable GPS fix in chapter telemetry");
             continue;
         };
         let (Some(utc), Some(gps_sample)) = (payload.utc, payload.samples.first()) else {
+            tracing::debug!(file = %path.display(), "GPS fix missing UTC or sample; skipping");
             continue;
         };
 
         let reference = chapter_times[i] + span_from_secs(sample.time_s);
         let offset_s = utc.duration_since(reference).as_secs_f64();
+        tracing::debug!(
+            file = %path.display(),
+            offset_s,
+            "GPS fix found; session clock offset derived"
+        );
         return (
             Some(SessionTelemetry {
                 offset_s,
@@ -1228,7 +1236,7 @@ mod tests {
         let source = GoproSource {
             require_marker: false,
         };
-        let progress = Progress::counted(true);
+        let progress = Progress::counted(true, "Scanning");
         let (ignore, tz, imported_at, _hidden) = test_ctx_with_tz(TimeZone::UTC);
         let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
 

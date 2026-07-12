@@ -55,12 +55,24 @@ pub struct GroupResult {
     /// source file: it must never be treated as a deletion candidate.
     pub sidecar_outcome: Option<TransferOutcome>,
     pub deleted_from_source: bool,
+    /// Where this group's files landed (`Keep`'s destination or
+    /// `Quarantine`'s quarantine path); `None` for an `Ignore` verdict
+    /// or a `Quarantine` group whose `copy_quarantine: false` left it
+    /// on the source. Carried so the human report's verbose grouping
+    /// (improve-console-output design D7) can header each group with
+    /// where it went, without re-deriving it from the plan.
+    pub destination: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
 pub struct ExecuteReport {
     pub groups: Vec<GroupResult>,
     pub deletion_skipped_reason: Option<String>,
+    /// The effective `delete_source` this run executed with — carried
+    /// so the human report can tell "no group was deleted because
+    /// deletion wasn't requested" apart from "... because deletion was
+    /// requested but every group was ineligible" (design D7).
+    pub delete_source: bool,
 }
 
 /// Gates sidecar-writing and "handled" reporting: the file is in
@@ -164,7 +176,7 @@ fn execute_inner(
         if let Some(dir) = target_dir {
             for media_file in &action.group.files {
                 if let Some(name) = media_file.path.file_name() {
-                    progress.set_message(name.to_string_lossy().into_owned());
+                    progress.set_message(format!("copying {}", name.to_string_lossy()));
                 }
                 let outcome = transfer_file(
                     &media_file.path,
@@ -217,6 +229,7 @@ fn execute_inner(
             files,
             sidecar_outcome,
             deleted_from_source: false,
+            destination: target_dir.map(Path::to_path_buf),
         });
     }
 
@@ -229,11 +242,16 @@ fn execute_inner(
         });
 
         if any_eligible {
-            match confirm(
+            let decision = confirm(
                 "Delete source files now that they are safely imported? [y/N]",
                 assume_yes,
                 stdin_is_terminal,
-            )? {
+            )?;
+            tracing::info!(
+                decision = confirmation_label(&decision),
+                "deletion decision"
+            );
+            match decision {
                 Confirmation::Confirmed => {
                     for group in &mut groups {
                         let all_ok = !group.files.is_empty()
@@ -266,6 +284,7 @@ fn execute_inner(
     Ok(ExecuteReport {
         groups,
         deletion_skipped_reason,
+        delete_source,
     })
 }
 
@@ -273,6 +292,14 @@ pub enum Confirmation {
     Confirmed,
     DeclinedInteractive,
     SkippedNonInteractive,
+}
+
+fn confirmation_label(decision: &Confirmation) -> &'static str {
+    match decision {
+        Confirmation::Confirmed => "confirmed",
+        Confirmation::DeclinedInteractive => "declined",
+        Confirmation::SkippedNonInteractive => "skipped_non_interactive",
+    }
 }
 
 /// Destructive steps prompt on stdin unless `--yes` is passed;
@@ -397,8 +424,26 @@ fn transfer_inner(
                 let dest_ts = systemtime_to_timestamp(dest_mtime);
                 let diff_ms = (dest_ts - ref_ts).get_milliseconds().unsigned_abs();
                 if diff_ms <= 100 {
+                    tracing::debug!(
+                        file = %dest_candidate.display(),
+                        size = src_size,
+                        diff_ms,
+                        "quick-match hit"
+                    );
                     return Ok(TransferOutcome::SkippedQuickMatch);
                 }
+                tracing::debug!(
+                    file = %dest_candidate.display(),
+                    diff_ms,
+                    "quick-match miss: mtime outside tolerance"
+                );
+            } else {
+                tracing::debug!(
+                    file = %dest_candidate.display(),
+                    dest_size = dest_meta.len(),
+                    src_size,
+                    "quick-match miss: size differs"
+                );
             }
         }
     }
@@ -439,6 +484,11 @@ fn transfer_inner(
         }
     };
 
+    // The read-back step announces itself separately from the copy
+    // that preceded it (design D2) — the bar sits near 100% here since
+    // verification targets the fast destination disk, not the slow
+    // source medium; the message explains the brief tail instead.
+    progress.set_message(format!("verifying {}", file_name.to_string_lossy()));
     if let Err(e) = verify_part(&part_path, src, &final_path, &stream_hash) {
         let _ = fs::remove_file(&part_path);
         return Err(e);
@@ -507,9 +557,20 @@ fn resolve_destination(
     let mut suffix = 0u32;
     loop {
         if !candidate.exists() {
+            if suffix > 0 {
+                tracing::debug!(
+                    file = %candidate.display(),
+                    collisions = suffix,
+                    "collision resolved: content differs, suffixed"
+                );
+            }
             return Ok(Some(candidate));
         }
         if &hash_file(&candidate)? == src_hash {
+            tracing::debug!(
+                file = %candidate.display(),
+                "collision resolved: identical content, skipping copy"
+            );
             return Ok(None);
         }
         suffix += 1;
@@ -687,6 +748,53 @@ mod tests {
         assert_eq!(fs::read(dest_dir.join("clip.mp4")).unwrap(), b"hello");
         assert!(src.exists(), "transfer never deletes the source");
         assert!(!dest_dir.join("clip.mp4.part").exists());
+    }
+
+    // --- phase messages (design D2, task 4.2) ---
+
+    #[test]
+    fn message_sequence_over_one_transfer_is_copying_then_verifying() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let group = MediaGroup {
+            name: "session".to_string(),
+            files: vec![MediaFile {
+                path: src.clone(),
+                size: 5,
+                recorded_at: None,
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group,
+                verdict: Verdict::Keep,
+                destination: Some(dest_dir.clone()),
+                quarantine_path: None,
+            }],
+        };
+
+        let progress = Progress::hidden();
+        let report = execute(&plan, false, false, false, &progress).unwrap();
+        assert!(matches!(
+            report.groups[0].files[0].outcome,
+            TransferOutcome::Transferred
+        ));
+        assert_eq!(
+            progress.message_history(),
+            vec![
+                "copying clip.mp4".to_string(),
+                "verifying clip.mp4".to_string()
+            ],
+            "one file should announce copying, then verifying, in that order"
+        );
     }
 
     // spec scenario "Successful verified copy" / "Source is read once
@@ -1069,7 +1177,7 @@ mod tests {
             }],
         };
 
-        let progress = Progress::new(true);
+        let progress = Progress::new(true, "Importing");
         let report = execute(&plan, false, false, false, &progress).unwrap();
         assert!(matches!(
             report.groups[0].files[0].outcome,
@@ -1119,7 +1227,7 @@ mod tests {
             }],
         };
 
-        let progress = Progress::new(true);
+        let progress = Progress::new(true, "Importing");
         let report = execute(&plan, false, false, true, &progress).unwrap();
         assert!(matches!(
             report.groups[0].files[0].outcome,

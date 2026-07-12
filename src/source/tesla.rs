@@ -96,9 +96,13 @@ impl ImportSource for TeslaSource {
 
     fn scan(&self, root: &Path, ctx: &ScanContext) -> Result<Vec<(MediaGroup, Verdict)>> {
         let teslacam = root.join("TeslaCam");
-        let mut groups = Vec::new();
         let mut stray_files: Vec<PathBuf> = Vec::new();
 
+        // First pass: list what there is to do — event folders (a
+        // cheap directory listing, no `event.json` parsing yet) and,
+        // when enabled, RecentClips files — so the total is known
+        // before any per-event work starts (design D3).
+        let mut event_dirs: Vec<(EventCategory, PathBuf)> = Vec::new();
         for (category, dir_name) in [
             (EventCategory::Saved, "SavedClips"),
             (EventCategory::Sentry, "SentryClips"),
@@ -110,11 +114,28 @@ impl ImportSource for TeslaSource {
             for entry in entries.flatten() {
                 let path = entry.path();
                 if path.is_dir() {
-                    groups.push(self.build_event_group(category, &path, ctx));
+                    event_dirs.push((category, path));
                 } else if path.is_file() && !ctx.ignore.is_match(&path) {
                     stray_files.push(path);
                 }
             }
+        }
+
+        let recent_dir = teslacam.join("RecentClips");
+        let recent_files = if self.events.contains(&EventCategory::Recent) {
+            list_recent_files(&recent_dir, ctx.ignore)
+        } else {
+            Vec::new()
+        };
+
+        ctx.progress
+            .set_length(event_dirs.len() as u64 + recent_files.len() as u64);
+
+        let mut groups = Vec::with_capacity(event_dirs.len() + 1);
+        for (category, dir) in event_dirs {
+            ctx.progress.inc(1);
+            ctx.progress.set_message(file_name(&dir));
+            groups.push(self.build_event_group(category, &dir, ctx));
         }
 
         if let Ok(entries) = fs::read_dir(&teslacam) {
@@ -126,12 +147,14 @@ impl ImportSource for TeslaSource {
             }
         }
 
-        if self.events.contains(&EventCategory::Recent) {
+        if !recent_files.is_empty() {
             let (recent_groups, recent_unrecognized) =
-                scan_recent_clips(&teslacam.join("RecentClips"), ctx);
+                cluster_recent_clips(recent_files, &recent_dir, ctx);
             groups.extend(recent_groups);
             stray_files.extend(recent_unrecognized);
         }
+
+        ctx.progress.finish();
 
         if !stray_files.is_empty() {
             groups.push(unrecognized_group(stray_files));
@@ -344,23 +367,37 @@ fn collect_group_files(
         .collect()
 }
 
+/// Lists `RecentClips/` files up front (design D3) — a plain directory
+/// listing, cheap enough to run before progress totals are set, unlike
+/// event folders there's no per-file parsing to defer.
+fn list_recent_files(dir: &Path, ignore: &globset::GlobSet) -> Vec<PathBuf> {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.is_file() && !ignore.is_match(p))
+        .collect()
+}
+
 /// Groups `RecentClips/` files by their filename-stem timestamp into
 /// per-minute clusters (design D6). Only called when `recent` is
-/// enabled (spec: "RecentClips import is opt-in"). Returns the
-/// per-minute Keep groups plus any file whose name doesn't carry a
-/// recognizable timestamp stem.
-fn scan_recent_clips(dir: &Path, ctx: &ScanContext) -> (Vec<(MediaGroup, Verdict)>, Vec<PathBuf>) {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return (Vec::new(), Vec::new());
-    };
-
+/// enabled (spec: "RecentClips import is opt-in"). Ticks the scan
+/// progress once per file as it's assigned to a cluster or the
+/// unrecognized bucket (design D3: "advances as each is grouped").
+/// Returns the per-minute Keep groups plus any file whose name doesn't
+/// carry a recognizable timestamp stem.
+fn cluster_recent_clips(
+    files: Vec<PathBuf>,
+    dir: &Path,
+    ctx: &ScanContext,
+) -> (Vec<(MediaGroup, Verdict)>, Vec<PathBuf>) {
     let mut clusters: HashMap<String, Vec<PathBuf>> = HashMap::new();
     let mut unrecognized = Vec::new();
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if !path.is_file() || ctx.ignore.is_match(&path) {
-            continue;
-        }
+    for path in files {
+        ctx.progress.inc(1);
+        ctx.progress.set_message(file_name(&path));
         let matched = path
             .file_name()
             .and_then(|n| n.to_str())
@@ -878,5 +915,73 @@ mod tests {
                 .all(|(_, verdict)| !matches!(verdict, Verdict::Quarantine)),
             "Tesla verdicts must never be Quarantine"
         );
+    }
+
+    // --- scan progress (design D3, task 5.2) ---
+
+    #[test]
+    fn scan_progress_reaches_total_event_folder_count() {
+        // Mirrors gopro's `scan_progress_reaches_total_chapter_count`:
+        // the total is known up front from directory listings, and one
+        // tick lands per discovered event folder.
+        let dir = tempfile::tempdir().unwrap();
+        let saved = dir.path().join("TeslaCam/SavedClips/2026-07-04_18-23-51");
+        write(
+            &saved.join("event.json"),
+            &event_json("user_interaction_honk"),
+        );
+        let sentry = dir.path().join("TeslaCam/SentryClips/2026-07-04_18-24-00");
+        write(
+            &sentry.join("event.json"),
+            &event_json("sentry_aware_object_detection"),
+        );
+
+        let progress = Progress::counted(true, "Scanning");
+        let (ignore, tz, imported_at, _hidden) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
+        let groups = source(default_events(), None)
+            .scan(dir.path(), &ctx)
+            .unwrap();
+
+        assert_eq!(groups.len(), 2, "both event folders should produce a group");
+        assert_eq!(progress.position(), 2, "one tick per event folder");
+    }
+
+    #[test]
+    fn recent_clips_units_only_count_toward_progress_when_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let saved = dir.path().join("TeslaCam/SavedClips/2026-07-04_18-23-51");
+        write(
+            &saved.join("event.json"),
+            &event_json("user_interaction_honk"),
+        );
+        let recent = dir.path().join("TeslaCam/RecentClips");
+        write(&recent.join("2026-07-04_18-40-00-front.mp4"), "front");
+        write(&recent.join("2026-07-04_18-41-00-front.mp4"), "front");
+
+        let (ignore, tz, imported_at, _hidden) = test_ctx_parts();
+
+        // recent disabled: total covers only the one event folder.
+        let progress = Progress::counted(true, "Scanning");
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
+        let groups = source(default_events(), None)
+            .scan(dir.path(), &ctx)
+            .unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(progress.position(), 1);
+
+        // recent enabled: total also covers the two RecentClips files,
+        // one tick per file as it's grouped into its per-minute cluster.
+        let mut events = default_events();
+        events.push(EventCategory::Recent);
+        let progress = Progress::counted(true, "Scanning");
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
+        let groups = source(events, None).scan(dir.path(), &ctx).unwrap();
+        assert_eq!(
+            groups.len(),
+            3,
+            "1 saved event + 2 distinct-minute recent clusters"
+        );
+        assert_eq!(progress.position(), 3, "1 event folder + 2 recent files");
     }
 }

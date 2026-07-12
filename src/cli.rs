@@ -1,9 +1,11 @@
 //! clap CLI surface: `scan` and `import`, plus the global flags every
 //! subcommand shares.
 
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
+use tracing_subscriber::fmt::MakeWriter;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -191,6 +193,11 @@ pub fn override_pair(set: bool, unset: bool) -> Option<bool> {
 /// Wires verbosity to a `tracing` filter. `-v`/`-vv` are the only
 /// knobs (design D7 area); user-facing report output goes through
 /// `println!`, not `tracing`, per AGENTS.md conventions.
+///
+/// Writes to stderr, never stdout (spec: "Diagnostic logging is
+/// level-gated and never corrupts output") — stdout carries only the
+/// plan/report/JSON document, and `--json` promises nothing else
+/// appears there.
 pub fn init_tracing(verbosity: u8) {
     let level = match verbosity {
         0 => tracing::Level::WARN,
@@ -200,7 +207,34 @@ pub fn init_tracing(verbosity: u8) {
     tracing_subscriber::fmt()
         .with_max_level(level)
         .with_target(false)
+        .with_writer(DiagnosticWriter)
         .init();
+}
+
+/// Writes diagnostic lines to stderr wrapped in `progress::suspend`
+/// (design D8): while a progress bar is registered, this clears it,
+/// prints the line, and lets the bar redraw underneath — the line
+/// never lands mid-redraw. A no-op passthrough when no bar has ever
+/// been registered, which is the common case outside an active scan
+/// or transfer.
+struct DiagnosticWriter;
+
+impl Write for DiagnosticWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        crate::progress::suspend(|| io::stderr().write(buf))
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().flush()
+    }
+}
+
+impl<'a> MakeWriter<'a> for DiagnosticWriter {
+    type Writer = DiagnosticWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        DiagnosticWriter
+    }
 }
 
 #[cfg(test)]

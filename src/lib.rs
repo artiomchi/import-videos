@@ -260,7 +260,7 @@ fn run_scan(
     json: bool,
 ) -> Result<ExitCode> {
     let profile = resolve_profile(cfg, profile_name, overrides)?;
-    let scan_progress = progress::Progress::counted(scan_progress_enabled(json));
+    let scan_progress = progress::Progress::counted(scan_progress_enabled(json), "Scanning");
     match scan_profile(cfg, &profile, source_override, &scan_progress)? {
         None => print_no_sources(profile_name, json),
         Some(import_plan) => print_plan(&import_plan, verbose, &cfg.timezone, json),
@@ -282,7 +282,7 @@ fn run_import(
 ) -> Result<ExitCode> {
     let profile = resolve_profile(cfg, profile_name, overrides)?;
 
-    let scan_progress = progress::Progress::counted(scan_progress_enabled(json));
+    let scan_progress = progress::Progress::counted(scan_progress_enabled(json), "Scanning");
     let Some(import_plan) = scan_profile(cfg, &profile, source_override, &scan_progress)? else {
         print_no_sources(profile_name, json);
         return Ok(ExitCode::Success);
@@ -293,10 +293,19 @@ fn run_import(
         return Ok(ExitCode::Success);
     }
 
+    // A non-dry-run, human-mode import states its intent before
+    // transferring anything (improve-console-output design D4): the
+    // same plan `scan` would print. JSON mode stays a single document
+    // (the execution report) — the spec's one-document contract wins
+    // over symmetry there.
+    if !json {
+        print_plan(&import_plan, verbose, &cfg.timezone, json);
+    }
+
     // A separate, byte-oriented Progress for the transfer phase (design
     // D6), built after scanning completes — the scan bar has already
     // finished and cleared by this point (add-scan-progress design D5).
-    let progress = progress::Progress::new(scan_progress_enabled(json));
+    let progress = progress::Progress::new(scan_progress_enabled(json), "Importing");
 
     let exec_report = transfer::execute(
         &import_plan,
@@ -309,7 +318,7 @@ fn run_import(
     if json {
         print_json(&report::results_to_json(&exec_report));
     } else {
-        print!("{}", report::render_results(&exec_report));
+        print!("{}", report::render_results(&exec_report, verbose));
     }
 
     let any_failed = exec_report.groups.iter().any(|g| {

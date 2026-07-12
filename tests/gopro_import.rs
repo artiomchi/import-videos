@@ -200,7 +200,6 @@ fn scan_and_dry_run_are_read_only() {
     let stdout = String::from_utf8_lossy(&scan_output.stdout);
     assert!(stdout.contains("KEEP"));
     assert!(stdout.contains("session-0123"));
-    assert!(stdout.contains("import.json"));
     assert!(!dest.exists(), "scan must not create the destination");
     assert_eq!(tree_snapshot(&card), card_before);
 
@@ -448,5 +447,155 @@ fn copy_quarantine_false_leaves_unmarked_on_card_and_keeps_marked() {
     assert!(
         card.join("DCIM/100GOPRO/GX010124.MP4").exists(),
         "unmarked session must remain on the card when copy_quarantine is false"
+    );
+}
+
+// --- improve-console-output design D4, task 8.2: import states its plan before transferring ---
+
+#[test]
+fn non_dry_run_import_prints_the_plan_before_the_execution_report() {
+    let dir = tempfile::tempdir().unwrap();
+    let card = dir.path().join("card");
+    let creation_time = creation_time_2026_07_09();
+    write_chapter(
+        &card.join("DCIM/100GOPRO/GX010123.MP4"),
+        creation_time,
+        &[5000],
+    );
+
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    gopro_config(&config_path, &dest, "");
+
+    let output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "import",
+            "gopro",
+            "--source",
+            card.to_str().unwrap(),
+            "--yes",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let plan_at = stdout
+        .find("[KEEP] session-0123")
+        .expect("plan rendering must appear on stdout before the transfer runs");
+    let report_at = stdout
+        .find("Summary: 1 transferred")
+        .expect("execution report's summary line must appear on stdout");
+    assert!(
+        plan_at < report_at,
+        "plan must print before the execution report: {stdout}"
+    );
+}
+
+// --- improve-console-output design D9, task 9.3: -v unlocks INFO milestones ---
+
+#[test]
+fn verbose_flag_unlocks_info_milestones_a_default_run_does_not_emit() {
+    let dir = tempfile::tempdir().unwrap();
+    let card = dir.path().join("card");
+    let creation_time = creation_time_2026_07_09();
+    write_chapter(
+        &card.join("DCIM/100GOPRO/GX010123.MP4"),
+        creation_time,
+        &[5000],
+    );
+
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    gopro_config(&config_path, &dest, "");
+
+    let default_output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "scan",
+            "gopro",
+            "--source",
+            card.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(default_output.status.code(), Some(0));
+    let default_stderr = String::from_utf8_lossy(&default_output.stderr);
+    assert!(
+        !default_stderr.contains("scan complete"),
+        "a default run must not emit INFO milestones: {default_stderr}"
+    );
+
+    let verbose_output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "-v",
+            "scan",
+            "gopro",
+            "--source",
+            card.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(verbose_output.status.code(), Some(0));
+    let verbose_stderr = String::from_utf8_lossy(&verbose_output.stderr);
+    assert!(
+        verbose_stderr.contains("source resolved"),
+        "got: {verbose_stderr}"
+    );
+    assert!(
+        verbose_stderr.contains("scan complete"),
+        "got: {verbose_stderr}"
+    );
+    assert!(
+        verbose_stderr.contains("plan built"),
+        "got: {verbose_stderr}"
+    );
+}
+
+#[test]
+fn non_dry_run_import_json_still_emits_exactly_one_document() {
+    let dir = tempfile::tempdir().unwrap();
+    let card = dir.path().join("card");
+    let creation_time = creation_time_2026_07_09();
+    write_chapter(
+        &card.join("DCIM/100GOPRO/GX010123.MP4"),
+        creation_time,
+        &[5000],
+    );
+
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    gopro_config(&config_path, &dest, "");
+
+    let output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "import",
+            "gopro",
+            "--source",
+            card.to_str().unwrap(),
+            "--yes",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be exactly one JSON document: {e}\n{stdout}"));
+    assert!(
+        value.get("groups").is_some(),
+        "the one document must be the execution report, not the plan: {value}"
     );
 }

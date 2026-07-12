@@ -64,6 +64,7 @@ pub fn resolve_source(
                 std::io::Error::new(std::io::ErrorKind::NotFound, "source path does not exist"),
             ));
         }
+        tracing::info!(source = %path.display(), "source resolved");
         return Ok(Some(path));
     }
 
@@ -74,6 +75,7 @@ pub fn resolve_source(
         for entry in entries.flatten() {
             let candidate = entry.path();
             if candidate.is_dir() && source_impl.detect(&candidate) {
+                tracing::info!(source = %candidate.display(), "source resolved");
                 return Ok(Some(candidate));
             }
         }
@@ -100,9 +102,16 @@ pub fn build_plan(
         progress,
     };
     let groups = source_impl.scan(source_root, &ctx)?;
+    tracing::info!(groups = groups.len(), "scan complete");
     let mut actions = Vec::with_capacity(groups.len());
 
+    let (mut kept, mut quarantined, mut ignored) = (0usize, 0usize, 0usize);
     for (group, verdict) in groups {
+        match &verdict {
+            Verdict::Keep => kept += 1,
+            Verdict::Quarantine => quarantined += 1,
+            Verdict::Ignore(_) => ignored += 1,
+        }
         let (destination, quarantine_path) = match &verdict {
             Verdict::Keep => {
                 let relative = profile
@@ -128,6 +137,7 @@ pub fn build_plan(
             quarantine_path,
         });
     }
+    tracing::info!(kept, quarantined, ignored, "plan built");
 
     Ok(ImportPlan { actions })
 }

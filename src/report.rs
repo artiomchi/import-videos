@@ -8,16 +8,36 @@
 //! that shouldn't drift with internal refactors.
 
 use std::fmt::Write;
+use std::path::Path;
 
 use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde::Serialize;
 
-use crate::plan::ImportPlan;
-use crate::source::{Sidecar, Verdict};
-use crate::transfer::{ExecuteReport, TransferOutcome};
+use crate::plan::{ImportPlan, PlannedAction};
+use crate::source::{MediaFile, Sidecar, Verdict};
+use crate::transfer::{ExecuteReport, FileResult, GroupResult, TransferOutcome};
 
 const RFC3339_FORMAT: &str = "%Y-%m-%dT%H:%M:%S%:z";
+const SHORT_TIME_FORMAT: &str = "%Y-%m-%d %H:%M";
+
+/// The exact reason string both device modules (`gopro`, `tesla`) use
+/// for their catch-all stray-files group (design D6) — the hook
+/// `render_plan` uses to special-case that one group's listing instead
+/// of the usual time/size line.
+const UNRECOGNIZED_REASON: &str = "unrecognized file(s)";
+const UNRECOGNIZED_DEFAULT_CAP: usize = 5;
+
+/// Formats `n` with `word` pluralized the plain way (`"1 file"`,
+/// `"3 files"`) — every count in the plan/results renderers goes
+/// through this so wording stays consistent.
+fn plural(n: usize, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
+}
 
 /// Renders `ts` as an RFC 3339 string in `tz` (design D4: "Timestamps
 /// SHALL be RFC 3339 strings rendered in the configured timezone").
@@ -26,52 +46,145 @@ fn format_ts(ts: Timestamp, tz: &TimeZone) -> String {
     jiff::fmt::strtime::format(RFC3339_FORMAT, &zoned).unwrap_or_else(|_| ts.to_string())
 }
 
-/// Renders every planned action: verdict, reason, and resolved path.
-/// `Keep`/`Quarantine` don't carry a per-group reason string (only
-/// `Ignore` does — see `Verdict`), so they get a fixed label; richer
-/// reasons are a device-module concern via the group's `context`.
-///
-/// Quarantine entries are omitted unless `verbose` — a real card can
-/// quarantine hundreds of unmarked sessions, and scrolling past all of
-/// them to see what's actually being kept isn't useful by default.
-/// Marker details (per-marker timestamps) are likewise verbose-only.
-/// A summary line always closes the output, so counts are visible
-/// even when individual entries are suppressed.
+/// Per-verdict running totals (design D5's summary extension, task
+/// 6.5): group count plus the file count and byte total across every
+/// group of that verdict, so the closing summary line carries the same
+/// weight information the entries themselves show.
+#[derive(Default)]
+struct VerdictTally {
+    groups: usize,
+    files: usize,
+    bytes: u64,
+}
+
+impl VerdictTally {
+    fn add(&mut self, files: &[MediaFile]) {
+        self.groups += 1;
+        self.files += files.len();
+        self.bytes += files.iter().map(|f| f.size).sum::<u64>();
+    }
+
+    fn render(&self, label: &str) -> String {
+        format!(
+            "{} {label} ({}, {})",
+            self.groups,
+            plural(self.files, "file"),
+            format_size(self.bytes)
+        )
+    }
+}
+
+#[derive(Default)]
+struct VerdictTotals {
+    kept: VerdictTally,
+    quarantined: VerdictTally,
+    ignored: VerdictTally,
+}
+
+impl VerdictTotals {
+    fn record(&mut self, verdict: &Verdict, files: &[MediaFile]) {
+        match verdict {
+            Verdict::Keep => self.kept.add(files),
+            Verdict::Quarantine => self.quarantined.add(files),
+            Verdict::Ignore(_) => self.ignored.add(files),
+        }
+    }
+
+    fn total_groups(&self) -> usize {
+        self.kept.groups + self.quarantined.groups + self.ignored.groups
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "{}, {}, {} ({} total)",
+            self.kept.render("kept"),
+            self.quarantined.render("quarantined"),
+            self.ignored.render("ignored"),
+            self.total_groups()
+        )
+    }
+}
+
+/// Renders every planned action, accounting for every group either
+/// individually or in aggregate (design D5, D6). `Keep` and (with
+/// `-v`) `Quarantine` entries show the group's recorded time, file
+/// count, total size, and resolved path — no fixed per-verdict reason
+/// text; only `Ignore` carries a reason, since it's the one verdict
+/// where the reason varies per group. Quarantine entries collapse into
+/// a single rollup line by default — a real card can quarantine
+/// hundreds of unmarked sessions, and scrolling past all of them to
+/// see what's actually being kept isn't useful. The unrecognized-files
+/// group (present when a source has stray files) lists names instead,
+/// capped at 5 by default. A summary line with per-verdict file/byte
+/// totals always closes the output, so counts stay visible even when
+/// entries are aggregated or capped.
 pub fn render_plan(plan: &ImportPlan, verbose: bool, tz: &TimeZone) -> String {
     if plan.actions.is_empty() {
         return "No media found; nothing to import.\n".to_string();
     }
 
-    let mut kept = 0usize;
-    let mut quarantined = 0usize;
-    let mut ignored = 0usize;
-
     let mut out = String::new();
+    let mut totals = VerdictTotals::default();
+    let mut quarantine_entries: Vec<&PlannedAction> = Vec::new();
+
     for action in &plan.actions {
-        match &action.verdict {
-            Verdict::Keep => kept += 1,
-            Verdict::Quarantine => quarantined += 1,
-            Verdict::Ignore(_) => ignored += 1,
+        totals.record(&action.verdict, &action.group.files);
+
+        if matches!(action.verdict, Verdict::Quarantine) {
+            quarantine_entries.push(action);
+            if !verbose {
+                continue;
+            }
         }
 
-        if matches!(action.verdict, Verdict::Quarantine) && !verbose {
-            continue;
-        }
+        render_plan_entry(&mut out, action, verbose, tz);
+    }
 
-        let (verdict, reason, path) = match &action.verdict {
-            Verdict::Keep => (
-                "KEEP",
-                "matches profile criteria".to_string(),
-                action.destination.as_deref(),
-            ),
-            Verdict::Quarantine => (
-                "QUARANTINE",
-                "does not match profile criteria".to_string(),
-                action.quarantine_path.as_deref(),
-            ),
-            Verdict::Ignore(reason) => ("IGNORE", reason.clone(), None),
-        };
-        let _ = write!(out, "[{verdict}] {} — {reason}", action.group.name);
+    if !verbose && !quarantine_entries.is_empty() {
+        render_quarantine_rollup(&mut out, &quarantine_entries);
+    }
+
+    let _ = writeln!(out, "Summary: {}", totals.render());
+
+    out
+}
+
+/// Renders one plan entry: `[VERDICT] name`, then either the
+/// unrecognized-files listing or (for `Keep`/`Quarantine`) the time,
+/// size, and resolved path — `Ignore`'s reason clause is the only
+/// fixed-string exception, per design D5. Verbose-only detail (full
+/// RFC 3339 time, markers, sidecar filename) follows on indented
+/// lines.
+fn render_plan_entry(out: &mut String, action: &PlannedAction, verbose: bool, tz: &TimeZone) {
+    let label = match &action.verdict {
+        Verdict::Keep => "KEEP",
+        Verdict::Quarantine => "QUARANTINE",
+        Verdict::Ignore(_) => "IGNORE",
+    };
+    let path = match &action.verdict {
+        Verdict::Keep => action.destination.as_deref(),
+        Verdict::Quarantine => action.quarantine_path.as_deref(),
+        Verdict::Ignore(_) => None,
+    };
+
+    let _ = write!(out, "[{label}] {}", action.group.name);
+    if let Verdict::Ignore(reason) = &action.verdict {
+        let _ = write!(out, " — {reason}");
+    }
+
+    let is_unrecognized =
+        matches!(&action.verdict, Verdict::Ignore(reason) if reason == UNRECOGNIZED_REASON);
+    if is_unrecognized {
+        render_unrecognized_files(out, &action.group.files, verbose);
+    } else if !matches!(action.verdict, Verdict::Ignore(_)) {
+        let group_bytes: u64 = action.group.files.iter().map(|f| f.size).sum();
+        let short_time = format_short_ts(action.group.timestamp, tz);
+        let _ = write!(
+            out,
+            "  {short_time}  {}, {}",
+            plural(action.group.files.len(), "file"),
+            format_size(group_bytes)
+        );
         if let Some(path) = path {
             let _ = write!(out, " -> {}", path.display());
         } else if matches!(action.verdict, Verdict::Quarantine) {
@@ -80,49 +193,101 @@ pub fn render_plan(plan: &ImportPlan, verbose: bool, tz: &TimeZone) -> String {
             // recognized but deliberately left on the source.
             let _ = write!(out, " (quarantine copy disabled, left on source)");
         }
-        let _ = writeln!(out);
+    }
+    let _ = writeln!(out);
 
-        if verbose {
-            let zoned = action.group.timestamp.to_zoned(tz.clone());
-            let rendered = jiff::fmt::strtime::format("%Y-%m-%dT%H:%M:%S%:z", &zoned)
-                .unwrap_or_else(|_| action.group.timestamp.to_string());
-            let _ = write!(out, "  recorded at: {rendered}");
-            if let Some(source) = time_source(action.group.sidecar.as_ref()) {
-                let _ = write!(out, " (source: {source})");
+    if verbose {
+        let _ = write!(
+            out,
+            "  recorded at: {}",
+            format_ts(action.group.timestamp, tz)
+        );
+        if let Some(source) = time_source(action.group.sidecar.as_ref()) {
+            let _ = write!(out, " (source: {source})");
+        }
+        let _ = writeln!(out);
+        for marker in &action.group.markers {
+            let _ = write!(out, "  marker at {}", format_ts(marker.timestamp, tz));
+            if let Some(label) = &marker.label {
+                let _ = write!(out, " ({label})");
             }
             let _ = writeln!(out);
-            for marker in &action.group.markers {
-                let zoned_m = marker.timestamp.to_zoned(tz.clone());
-                let rendered_m = jiff::fmt::strtime::format("%Y-%m-%dT%H:%M:%S%:z", &zoned_m)
-                    .unwrap_or_else(|_| marker.timestamp.to_string());
-                let _ = write!(out, "  marker at {rendered_m}");
-                if let Some(label) = &marker.label {
-                    let _ = write!(out, " ({label})");
-                }
-                let _ = writeln!(out);
-            }
         }
-
         if let Some(sidecar) = &action.group.sidecar {
-            let sidecar_path = path.map(|p| p.join(&sidecar.filename));
-            match sidecar_path {
-                Some(p) => {
-                    let _ = writeln!(out, "  + sidecar: {}", p.display());
-                }
-                None => {
-                    let _ = writeln!(out, "  + sidecar: {}", sidecar.filename);
-                }
-            }
+            let _ = writeln!(out, "  + sidecar: {}", sidecar.filename);
         }
     }
+}
 
-    let _ = writeln!(
+fn format_short_ts(ts: Timestamp, tz: &TimeZone) -> String {
+    let zoned = ts.to_zoned(tz.clone());
+    jiff::fmt::strtime::format(SHORT_TIME_FORMAT, &zoned).unwrap_or_else(|_| ts.to_string())
+}
+
+/// Lists an unrecognized-files group's file names, sorted for
+/// determinism, capped at `UNRECOGNIZED_DEFAULT_CAP` unless `verbose`
+/// (design D6). The count lands in the entry line itself; a trailing
+/// "… and N more" line appears only when the cap actually truncates —
+/// at or under the cap, default and verbose output are identical.
+fn render_unrecognized_files(out: &mut String, files: &[MediaFile], verbose: bool) {
+    let mut names: Vec<String> = files.iter().map(|f| file_display_name(&f.path)).collect();
+    names.sort();
+
+    let _ = write!(out, " ({})", plural(names.len(), "file"));
+    let _ = writeln!(out);
+
+    let shown = if verbose {
+        names.len()
+    } else {
+        names.len().min(UNRECOGNIZED_DEFAULT_CAP)
+    };
+    for name in &names[..shown] {
+        let _ = writeln!(out, "  {name}");
+    }
+    let remaining = names.len() - shown;
+    if remaining > 0 {
+        let _ = writeln!(out, "  … and {remaining} more (-v to list all)");
+    }
+}
+
+fn file_display_name(path: &Path) -> String {
+    path.file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+/// One default-mode line standing in for every `Quarantine` entry
+/// (design D5): count, aggregate size, and the shared quarantine root
+/// — or a disabled note when `copy_quarantine: false` left every entry
+/// with no resolved path. All `Quarantine` actions in one plan share a
+/// profile-level `copy_quarantine` setting, so the first entry's
+/// presence/absence of a path is representative of the whole group.
+fn render_quarantine_rollup(out: &mut String, entries: &[&PlannedAction]) {
+    let count = entries.len();
+    let bytes: u64 = entries
+        .iter()
+        .flat_map(|a| &a.group.files)
+        .map(|f| f.size)
+        .sum();
+    let root = entries
+        .iter()
+        .find_map(|a| a.quarantine_path.as_deref().and_then(Path::parent));
+
+    let _ = write!(
         out,
-        "Summary: {kept} kept, {quarantined} quarantined, {ignored} ignored ({} total)",
-        plan.actions.len()
+        "Quarantine: {}, {}",
+        plural(count, "group"),
+        format_size(bytes)
     );
-
-    out
+    match root {
+        Some(root) => {
+            let _ = write!(out, " -> {}", root.display());
+        }
+        None => {
+            let _ = write!(out, " (quarantine copy disabled)");
+        }
+    }
+    let _ = writeln!(out, "  (-v to list)");
 }
 
 /// A device's sidecar may note where a group's timestamp came from
@@ -135,56 +300,228 @@ fn time_source(sidecar: Option<&Sidecar>) -> Option<&str> {
     sidecar?.content.get("time_source")?.as_str()
 }
 
-/// Renders the outcome of executing a plan: per-file transfer results,
-/// which groups were cleaned off the source, and why deletion was
-/// skipped, if it was.
-pub fn render_results(report: &ExecuteReport) -> String {
+/// Per-outcome running totals over an `ExecuteReport` (design D7, task
+/// 7.1) — the single source of truth both `render_results` and
+/// `results_to_json` tally from, so the human summary line and the
+/// JSON summary can never disagree on counts. Sidecar outcomes are
+/// deliberately excluded: they're never a source file, so they don't
+/// contribute to file-outcome counts (mirrors the pre-existing
+/// `results_to_json` behavior).
+#[derive(Default)]
+struct ResultsTally {
+    transferred: usize,
+    skipped_identical: usize,
+    skipped_quick_match: usize,
+    suffixed: usize,
+    skipped_quarantine_disabled: usize,
+    failed: usize,
+    deleted_groups: usize,
+}
+
+impl ResultsTally {
+    fn from_report(report: &ExecuteReport) -> Self {
+        let mut tally = Self::default();
+        for group in &report.groups {
+            if group.deleted_from_source {
+                tally.deleted_groups += 1;
+            }
+            for file in &group.files {
+                match &file.outcome {
+                    TransferOutcome::Transferred => tally.transferred += 1,
+                    TransferOutcome::SkippedIdentical => tally.skipped_identical += 1,
+                    TransferOutcome::SkippedQuickMatch => tally.skipped_quick_match += 1,
+                    TransferOutcome::Suffixed(_) => tally.suffixed += 1,
+                    TransferOutcome::SkippedQuarantineDisabled => {
+                        tally.skipped_quarantine_disabled += 1
+                    }
+                    TransferOutcome::Failed(_) => tally.failed += 1,
+                }
+            }
+        }
+        tally
+    }
+
+    /// The always-present closing line (spec: "Human-readable
+    /// execution report is summarized by default"). Quick-matched
+    /// skips are counted distinctly from already-imported skips, since
+    /// only the latter were content-verified. The deleted-groups clause
+    /// only appears when deletion was actually requested this run —
+    /// showing "0 deleted from source" on a run that never asked for
+    /// deletion would read as a failure that never happened.
+    fn summary_line(&self, delete_source_in_effect: bool) -> String {
+        let mut line = format!(
+            "Summary: {} transferred, {} skipped (already imported), {} quick-matched, {} FAILED",
+            self.transferred, self.skipped_identical, self.skipped_quick_match, self.failed
+        );
+        if delete_source_in_effect {
+            let _ = write!(
+                line,
+                ", {} deleted from source",
+                plural(self.deleted_groups, "group")
+            );
+        }
+        line
+    }
+}
+
+/// Renders the outcome of executing a plan (design D7). Default output
+/// shows only notable per-file outcomes (failed, suffixed, left on
+/// source because quarantine copying is disabled) and — for any group
+/// left undeleted while deletion was in effect — a line naming it with
+/// the reason; routine outcomes (transferred, skipped-identical,
+/// quick-matched) are counted but not listed. `-v` lists every file,
+/// grouped per media group with the group's destination as a header. A
+/// summary line always closes the output.
+pub fn render_results(report: &ExecuteReport, verbose: bool) -> String {
+    let tally = ResultsTally::from_report(report);
     let mut out = String::new();
+
+    // A group-level "not deleted" line is only informative when
+    // deletion ran per-group (no single global reason already explains
+    // every group uniformly) — when the whole run declined or skipped
+    // deletion up front, `deletion_skipped_reason` says so once, and
+    // repeating that per group would be noise.
+    let name_undeleted_groups = report.delete_source && report.deletion_skipped_reason.is_none();
+
     for group in &report.groups {
-        for file in &group.files {
-            let line = match &file.outcome {
-                TransferOutcome::Transferred => format!("transferred: {}", file.src.display()),
-                TransferOutcome::SkippedIdentical => {
-                    format!("skipped (already imported): {}", file.src.display())
-                }
-                TransferOutcome::SkippedQuickMatch => {
-                    format!(
-                        "skipped (quick-matched, not verified): {}",
-                        file.src.display()
-                    )
-                }
-                TransferOutcome::Suffixed(dest) => format!(
-                    "stored as {} (destination name collision): {}",
-                    dest.display(),
-                    file.src.display()
-                ),
-                TransferOutcome::SkippedQuarantineDisabled => format!(
-                    "left on source (quarantine copy disabled): {}",
-                    file.src.display()
-                ),
-                TransferOutcome::Failed(message) => {
-                    format!("FAILED: {} ({message})", file.src.display())
-                }
-            };
-            let _ = writeln!(out, "{line}");
-        }
-        match &group.sidecar_outcome {
-            Some(TransferOutcome::Transferred) => {
-                let _ = writeln!(out, "  sidecar written: {}", group.group_name);
-            }
-            Some(TransferOutcome::Failed(message)) => {
-                let _ = writeln!(out, "  SIDECAR FAILED: {} ({message})", group.group_name);
-            }
-            _ => {}
-        }
-        if group.deleted_from_source {
-            let _ = writeln!(out, "  deleted from source: {}", group.group_name);
+        if verbose {
+            render_group_verbose(&mut out, group);
+        } else {
+            render_group_notable(&mut out, group, name_undeleted_groups);
         }
     }
+
     if let Some(reason) = &report.deletion_skipped_reason {
         let _ = writeln!(out, "{reason}");
     }
+
+    let _ = writeln!(out, "{}", tally.summary_line(report.delete_source));
     out
+}
+
+fn file_outcome_line(file: &FileResult, include_name: bool) -> String {
+    let name = if include_name {
+        file.src.display().to_string()
+    } else {
+        file_display_name(&file.src)
+    };
+    match &file.outcome {
+        TransferOutcome::Transferred => format!("transferred: {name}"),
+        TransferOutcome::SkippedIdentical => format!("skipped (already imported): {name}"),
+        TransferOutcome::SkippedQuickMatch => {
+            format!("skipped (quick-matched, not verified): {name}")
+        }
+        TransferOutcome::Suffixed(dest) => format!(
+            "stored as {} (destination name collision): {name}",
+            dest.display()
+        ),
+        TransferOutcome::SkippedQuarantineDisabled => {
+            format!("left on source (quarantine copy disabled): {name}")
+        }
+        TransferOutcome::Failed(message) => format!("FAILED: {name} ({message})"),
+    }
+}
+
+/// Default-mode rendering for one group: only the outcomes worth
+/// surfacing without `-v` (design D7) — routine per-file lines
+/// (`Transferred`, `SkippedIdentical`, `SkippedQuickMatch`) are
+/// omitted, counted only in the summary.
+fn render_group_notable(out: &mut String, group: &GroupResult, name_undeleted_groups: bool) {
+    for file in &group.files {
+        if matches!(
+            file.outcome,
+            TransferOutcome::Suffixed(_)
+                | TransferOutcome::SkippedQuarantineDisabled
+                | TransferOutcome::Failed(_)
+        ) {
+            let _ = writeln!(out, "{}", file_outcome_line(file, true));
+        }
+    }
+    if let Some(TransferOutcome::Failed(message)) = &group.sidecar_outcome {
+        let _ = writeln!(out, "SIDECAR FAILED: {} ({message})", group.group_name);
+    }
+    if name_undeleted_groups
+        && !group.deleted_from_source
+        && let Some(reason) = undeleted_reason(group)
+    {
+        let _ = writeln!(
+            out,
+            "{}: not deleted from source ({reason})",
+            group.group_name
+        );
+    }
+}
+
+/// `-v` rendering for one group: a header naming its destination, then
+/// every file's outcome indented beneath it (design D7) — correlating
+/// with the plan output the same run's scan/dry-run would have shown.
+fn render_group_verbose(out: &mut String, group: &GroupResult) {
+    let _ = write!(out, "{}", group.group_name);
+    if let Some(dest) = &group.destination {
+        let _ = write!(out, " -> {}", dest.display());
+    }
+    let _ = writeln!(out);
+
+    for file in &group.files {
+        let _ = writeln!(out, "  {}", file_outcome_line(file, false));
+    }
+    match &group.sidecar_outcome {
+        Some(TransferOutcome::Transferred) => {
+            let _ = writeln!(out, "  sidecar written");
+        }
+        Some(TransferOutcome::Failed(message)) => {
+            let _ = writeln!(out, "  SIDECAR FAILED: {message}");
+        }
+        _ => {}
+    }
+    if group.deleted_from_source {
+        let _ = writeln!(out, "  deleted from source");
+    }
+}
+
+/// Explains, in one short clause, why a group wasn't cleaned off the
+/// source despite deletion being in effect (design D7, spec: "states
+/// why its group was not deleted from the source") — derived from the
+/// same eligibility rules `execute_inner` applies (`content_verified`,
+/// `sidecar_ok`), so it can never claim a reason execution didn't
+/// actually enforce.
+fn undeleted_reason(group: &GroupResult) -> Option<String> {
+    // An empty `files` list means this group was never a deletion
+    // candidate to begin with (an `Ignore` verdict never touches the
+    // filesystem) — nothing surprising to explain, so stay silent
+    // rather than flagging every ignored group whenever deletion is
+    // in effect elsewhere in the same run.
+    if group.files.is_empty() {
+        return None;
+    }
+    if let Some(file) = group
+        .files
+        .iter()
+        .find(|f| matches!(f.outcome, TransferOutcome::Failed(_)))
+    {
+        return Some(format!(
+            "{} failed to transfer",
+            file_display_name(&file.src)
+        ));
+    }
+    if group
+        .files
+        .iter()
+        .any(|f| matches!(f.outcome, TransferOutcome::SkippedQuickMatch))
+    {
+        return Some("quick-matched files were not content-verified".to_string());
+    }
+    if group
+        .files
+        .iter()
+        .any(|f| matches!(f.outcome, TransferOutcome::SkippedQuarantineDisabled))
+    {
+        return Some("quarantine copying is disabled".to_string());
+    }
+    if matches!(group.sidecar_outcome, Some(TransferOutcome::Failed(_))) {
+        return Some("its sidecar failed to write".to_string());
+    }
+    None
 }
 
 #[derive(Debug, Serialize)]
@@ -207,6 +544,10 @@ pub struct PlanActionJson {
     pub recorded_at: String,
     pub markers: Vec<MarkerJson>,
     pub sidecar_path: Option<String>,
+    /// Every file in the group, uncapped (design D6/task 6.6) — unlike
+    /// the human renderer, JSON never truncates an unrecognized-files
+    /// listing or omits quarantined groups' contents.
+    pub files: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -274,6 +615,13 @@ pub fn plan_to_json(plan: &ImportPlan, tz: &TimeZone) -> PlanJson {
                 None => sidecar.filename.clone(),
             });
 
+            let files = action
+                .group
+                .files
+                .iter()
+                .map(|f| f.path.display().to_string())
+                .collect();
+
             PlanActionJson {
                 group: action.group.name.clone(),
                 verdict: verdict.to_string(),
@@ -282,6 +630,7 @@ pub fn plan_to_json(plan: &ImportPlan, tz: &TimeZone) -> PlanJson {
                 quarantine_copy_disabled,
                 recorded_at: format_ts(action.group.timestamp, tz),
                 markers,
+                files,
                 sidecar_path,
             }
         })
@@ -320,6 +669,16 @@ pub struct GroupResultJson {
 #[derive(Debug, Serialize)]
 pub struct ResultsSummaryJson {
     pub transferred: usize,
+    /// Additive (task 7.1): previously folded into an unlabeled
+    /// per-file `outcome` string only; broken out here so the human
+    /// summary's "skipped (already imported)" / "quick-matched" counts
+    /// can be verified equal to the JSON report for the same run
+    /// (spec: "The summary counts SHALL equal those in the JSON
+    /// report").
+    pub skipped_identical: usize,
+    pub skipped_quick_match: usize,
+    pub suffixed: usize,
+    pub skipped_quarantine_disabled: usize,
     pub failed: usize,
     pub deleted_groups: usize,
 }
@@ -348,29 +707,21 @@ fn outcome_json(outcome: &TransferOutcome) -> (String, Option<String>, Option<St
     }
 }
 
-/// Builds the JSON view of an `ExecuteReport` (design D4).
+/// Builds the JSON view of an `ExecuteReport` (design D4). The summary
+/// is tallied from the same `ResultsTally` the human renderer uses
+/// (task 7.1), so the two can never disagree on counts.
 pub fn results_to_json(report: &ExecuteReport) -> ResultsJson {
-    let mut transferred = 0usize;
-    let mut failed = 0usize;
-    let mut deleted_groups = 0usize;
+    let tally = ResultsTally::from_report(report);
 
     let groups = report
         .groups
         .iter()
         .map(|group| {
-            if group.deleted_from_source {
-                deleted_groups += 1;
-            }
             let files = group
                 .files
                 .iter()
                 .map(|f| {
                     let (outcome, dest, error) = outcome_json(&f.outcome);
-                    match &f.outcome {
-                        TransferOutcome::Transferred => transferred += 1,
-                        TransferOutcome::Failed(_) => failed += 1,
-                        _ => {}
-                    }
                     FileResultJson {
                         src: f.src.display().to_string(),
                         outcome,
@@ -407,9 +758,13 @@ pub fn results_to_json(report: &ExecuteReport) -> ResultsJson {
         groups,
         deletion_skipped_reason: report.deletion_skipped_reason.clone(),
         summary: ResultsSummaryJson {
-            transferred,
-            failed,
-            deleted_groups,
+            transferred: tally.transferred,
+            skipped_identical: tally.skipped_identical,
+            skipped_quick_match: tally.skipped_quick_match,
+            suffixed: tally.suffixed,
+            skipped_quarantine_disabled: tally.skipped_quarantine_disabled,
+            failed: tally.failed,
+            deleted_groups: tally.deleted_groups,
         },
     }
 }
@@ -828,7 +1183,33 @@ mod tests {
         assert!(!out.contains("QUARANTINE"));
         assert!(!out.contains("marker at"));
         assert!(!out.contains("recorded at:"));
-        assert!(out.contains("Summary: 1 kept, 1 quarantined, 0 ignored (2 total)"));
+        assert!(
+            out.contains("Quarantine: 1 group, 0 B -> /quarantine  (-v to list)"),
+            "quarantine collapses to one rollup line naming the shared root: {out}"
+        );
+        assert!(out.contains(
+            "Summary: 1 kept (0 files, 0 B), 1 quarantined (0 files, 0 B), 0 ignored (0 files, 0 B) (2 total)"
+        ));
+    }
+
+    #[test]
+    fn non_verbose_quarantine_rollup_shows_disabled_note_without_a_path() {
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group: group("unmarked", vec![]),
+                verdict: Verdict::Quarantine,
+                destination: None,
+                quarantine_path: None, // copy_quarantine: false
+            }],
+        };
+
+        let out = render_plan(&plan, false, &jiff::tz::TimeZone::UTC);
+
+        assert!(
+            !out.contains("[QUARANTINE]"),
+            "individual entry suppressed by default"
+        );
+        assert!(out.contains("Quarantine: 1 group, 0 B (quarantine copy disabled)  (-v to list)"));
     }
 
     #[test]
@@ -848,7 +1229,13 @@ mod tests {
             out.contains("recorded at: 1970-01-01T00:00:00+00:00"),
             "verbose mode should show the group's (GPS-corrected, when available) recorded time"
         );
-        assert!(out.contains("Summary: 1 kept, 1 quarantined, 0 ignored (2 total)"));
+        assert!(
+            !out.contains("Quarantine:"),
+            "verbose mode lists quarantine entries individually, no rollup line"
+        );
+        assert!(out.contains(
+            "Summary: 1 kept (0 files, 0 B), 1 quarantined (0 files, 0 B), 0 ignored (0 files, 0 B) (2 total)"
+        ));
     }
 
     #[test]
@@ -906,29 +1293,225 @@ mod tests {
             !out_verbose.contains("->"),
             "must not show a path when copy is disabled"
         );
-        assert!(out_verbose.contains("Summary: 0 kept, 1 quarantined, 0 ignored (1 total)"));
+        assert!(out_verbose.contains(
+            "Summary: 0 kept (0 files, 0 B), 1 quarantined (0 files, 0 B), 0 ignored (0 files, 0 B) (1 total)"
+        ));
+    }
+
+    // --- results renderer (design D7, task 7.6) ---
+
+    fn file_result(src: &str, outcome: TransferOutcome) -> FileResult {
+        FileResult {
+            src: PathBuf::from(src),
+            outcome,
+        }
+    }
+
+    fn group_result(
+        name: &str,
+        files: Vec<FileResult>,
+        deleted_from_source: bool,
+        destination: Option<&str>,
+    ) -> GroupResult {
+        GroupResult {
+            group_name: name.to_string(),
+            verdict: Verdict::Keep,
+            files,
+            sidecar_outcome: None,
+            deleted_from_source,
+            destination: destination.map(PathBuf::from),
+        }
     }
 
     #[test]
     fn results_render_left_on_source_outcome() {
         // Task 4.3: SkippedQuarantineDisabled renders a clear message.
-        use crate::transfer::{ExecuteReport, FileResult, GroupResult};
         let report = ExecuteReport {
-            groups: vec![GroupResult {
-                group_name: "unmarked".to_string(),
-                verdict: Verdict::Quarantine,
-                files: vec![FileResult {
-                    src: PathBuf::from("/card/clip.mp4"),
-                    outcome: TransferOutcome::SkippedQuarantineDisabled,
-                }],
-                sidecar_outcome: None,
-                deleted_from_source: false,
-            }],
+            groups: vec![group_result(
+                "unmarked",
+                vec![file_result(
+                    "/card/clip.mp4",
+                    TransferOutcome::SkippedQuarantineDisabled,
+                )],
+                false,
+                None,
+            )],
             deletion_skipped_reason: None,
+            delete_source: false,
         };
 
-        let out = render_results(&report);
+        let out = render_results(&report, false);
         assert!(out.contains("left on source (quarantine copy disabled): /card/clip.mp4"));
+    }
+
+    #[test]
+    fn clean_run_renders_only_the_summary_line() {
+        let report = ExecuteReport {
+            groups: vec![
+                group_result(
+                    "a",
+                    vec![file_result("/card/a.mp4", TransferOutcome::Transferred)],
+                    true,
+                    Some("/dest/a"),
+                ),
+                group_result(
+                    "b",
+                    vec![file_result(
+                        "/card/b.mp4",
+                        TransferOutcome::SkippedIdentical,
+                    )],
+                    true,
+                    Some("/dest/b"),
+                ),
+            ],
+            deletion_skipped_reason: None,
+            delete_source: true,
+        };
+
+        let out = render_results(&report, false);
+        assert_eq!(
+            out.trim_end(),
+            "Summary: 1 transferred, 1 skipped (already imported), 0 quick-matched, 0 FAILED, 2 groups deleted from source"
+        );
+    }
+
+    #[test]
+    fn failure_is_visible_without_verbosity_and_names_why_its_group_stayed() {
+        let report = ExecuteReport {
+            groups: vec![
+                group_result(
+                    "ok",
+                    vec![file_result("/card/ok.mp4", TransferOutcome::Transferred)],
+                    true,
+                    Some("/dest/ok"),
+                ),
+                group_result(
+                    "broken",
+                    vec![file_result(
+                        "/card/broken.mp4",
+                        TransferOutcome::Failed("hash mismatch".to_string()),
+                    )],
+                    false,
+                    Some("/dest/broken"),
+                ),
+            ],
+            deletion_skipped_reason: None,
+            delete_source: true,
+        };
+
+        let out = render_results(&report, false);
+        assert!(out.contains("FAILED: /card/broken.mp4 (hash mismatch)"));
+        assert!(
+            out.contains("broken: not deleted from source (broken.mp4 failed to transfer)"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("ok: not deleted"),
+            "a successfully deleted group must not get a not-deleted line"
+        );
+        assert!(out.contains("1 transferred"));
+        assert!(out.contains("1 FAILED"));
+        assert!(out.contains("1 group deleted from source"));
+    }
+
+    #[test]
+    fn no_undeleted_line_when_deletion_was_never_requested() {
+        let report = ExecuteReport {
+            groups: vec![group_result(
+                "a",
+                vec![file_result(
+                    "/card/a.mp4",
+                    TransferOutcome::Failed("disk full".to_string()),
+                )],
+                false,
+                Some("/dest/a"),
+            )],
+            deletion_skipped_reason: None,
+            delete_source: false,
+        };
+
+        let out = render_results(&report, false);
+        assert!(out.contains("FAILED: /card/a.mp4"));
+        assert!(
+            !out.contains("not deleted from source"),
+            "delete_source was never requested, so no group should claim it wasn't deleted"
+        );
+        assert!(!out.contains("deleted from source"));
+    }
+
+    #[test]
+    fn verbose_groups_files_under_a_destination_header() {
+        let report = ExecuteReport {
+            groups: vec![group_result(
+                "session-a",
+                vec![
+                    file_result("/card/clip1.mp4", TransferOutcome::Transferred),
+                    file_result("/card/clip2.mp4", TransferOutcome::SkippedIdentical),
+                ],
+                true,
+                Some("/dest/2026/2026-07-09"),
+            )],
+            deletion_skipped_reason: None,
+            delete_source: true,
+        };
+
+        let out = render_results(&report, true);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "session-a -> /dest/2026/2026-07-09");
+        assert_eq!(lines[1], "  transferred: clip1.mp4");
+        assert_eq!(lines[2], "  skipped (already imported): clip2.mp4");
+        assert_eq!(lines[3], "  deleted from source");
+        assert!(out.contains("Summary: 1 transferred, 1 skipped"));
+    }
+
+    #[test]
+    fn human_summary_counts_equal_json_summary_counts() {
+        let report = ExecuteReport {
+            groups: vec![
+                group_result(
+                    "a",
+                    vec![
+                        file_result("/card/a1.mp4", TransferOutcome::Transferred),
+                        file_result("/card/a2.mp4", TransferOutcome::SkippedIdentical),
+                    ],
+                    true,
+                    Some("/dest/a"),
+                ),
+                group_result(
+                    "b",
+                    vec![
+                        file_result("/card/b1.mp4", TransferOutcome::SkippedQuickMatch),
+                        file_result(
+                            "/card/b2.mp4",
+                            TransferOutcome::Suffixed(PathBuf::from("/dest/b/b2-1.mp4")),
+                        ),
+                        file_result("/card/b3.mp4", TransferOutcome::Failed("nope".to_string())),
+                    ],
+                    false,
+                    Some("/dest/b"),
+                ),
+            ],
+            deletion_skipped_reason: None,
+            delete_source: true,
+        };
+
+        let human = render_results(&report, false);
+        let json = results_to_json(&report);
+
+        assert!(human.contains(&format!("{} transferred", json.summary.transferred)));
+        assert!(human.contains(&format!(
+            "{} skipped (already imported)",
+            json.summary.skipped_identical
+        )));
+        assert!(human.contains(&format!(
+            "{} quick-matched",
+            json.summary.skipped_quick_match
+        )));
+        assert!(human.contains(&format!("{} FAILED", json.summary.failed)));
+        assert!(human.contains(&format!(
+            "{} deleted from source",
+            plural(json.summary.deleted_groups, "group")
+        )));
     }
 
     // --- JSON view-models (task 2.3, design D4) ---
@@ -989,9 +1572,133 @@ mod tests {
         assert_eq!(value["summary"]["total"], 2);
     }
 
+    // --- entry format: time and size instead of boilerplate (design D5, task 6.1/6.7) ---
+
+    fn media_file(path: &str, size: u64) -> MediaFile {
+        MediaFile {
+            path: PathBuf::from(path),
+            size,
+            recorded_at: None,
+        }
+    }
+
+    #[test]
+    fn keep_entry_shows_short_time_file_count_and_size_no_boilerplate_reason() {
+        let mut kept = group("kept", vec![]);
+        kept.timestamp = "2026-07-09T07:41:03Z".parse().unwrap();
+        kept.files = vec![
+            media_file("/card/a.mp4", 1024),
+            media_file("/card/b.mp4", 1024),
+        ];
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group: kept,
+                verdict: Verdict::Keep,
+                destination: Some(PathBuf::from("/dest/kept")),
+                quarantine_path: None,
+            }],
+        };
+
+        let out = render_plan(&plan, false, &jiff::tz::TimeZone::UTC);
+
+        assert!(
+            out.contains("[KEEP] kept  2026-07-09 07:41  2 files, 2.0 KiB -> /dest/kept"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("matches profile criteria"),
+            "fixed boilerplate reason text must be gone"
+        );
+    }
+
+    // --- unrecognized files: capped by default, uncapped with -v (design D6, task 6.3/6.7) ---
+
+    fn unrecognized_plan(n: usize) -> ImportPlan {
+        let files: Vec<MediaFile> = (0..n)
+            .map(|i| media_file(&format!("/card/stray{i:02}.dat"), 10))
+            .collect();
+        let group = MediaGroup {
+            name: "unrecognized".to_string(),
+            files,
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        ImportPlan {
+            actions: vec![PlannedAction {
+                group,
+                verdict: Verdict::Ignore("unrecognized file(s)".to_string()),
+                destination: None,
+                quarantine_path: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn unrecognized_files_capped_at_five_by_default() {
+        let plan = unrecognized_plan(8);
+        let out = render_plan(&plan, false, &jiff::tz::TimeZone::UTC);
+
+        assert!(out.contains("[IGNORE] unrecognized — unrecognized file(s) (8 files)"));
+        for i in 0..5 {
+            assert!(out.contains(&format!("stray{i:02}.dat")), "{out}");
+        }
+        for i in 5..8 {
+            assert!(!out.contains(&format!("stray{i:02}.dat")), "{out}");
+        }
+        assert!(out.contains("… and 3 more (-v to list all)"));
+    }
+
+    #[test]
+    fn unrecognized_files_all_listed_with_verbose() {
+        let plan = unrecognized_plan(8);
+        let out = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
+
+        for i in 0..8 {
+            assert!(out.contains(&format!("stray{i:02}.dat")), "{out}");
+        }
+        assert!(!out.contains("more (-v to list all)"));
+    }
+
+    #[test]
+    fn unrecognized_files_at_cap_render_identically_default_and_verbose() {
+        let plan = unrecognized_plan(5);
+        let default_out = render_plan(&plan, false, &jiff::tz::TimeZone::UTC);
+        let verbose_out = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
+
+        assert!(!default_out.contains("more (-v to list all)"));
+        for i in 0..5 {
+            assert!(default_out.contains(&format!("stray{i:02}.dat")));
+        }
+        // The verbose output additionally carries the `recorded at:` line;
+        // strip it before comparing the file listing itself.
+        let verbose_files: String = verbose_out
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("recorded at:"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(default_out.trim_end(), verbose_files.trim_end());
+    }
+
+    // --- plan JSON files array: uncapped even for a truncated human listing (task 6.6) ---
+
+    #[test]
+    fn plan_json_files_array_is_never_truncated() {
+        let plan = unrecognized_plan(8);
+        let json = plan_to_json(&plan, &jiff::tz::TimeZone::UTC);
+
+        assert_eq!(json.actions.len(), 1);
+        assert_eq!(
+            json.actions[0].files.len(),
+            8,
+            "JSON must name every file even though the human render caps at 5"
+        );
+    }
+
     #[test]
     fn results_json_reports_outcomes_and_summary() {
-        use crate::transfer::{ExecuteReport, FileResult, GroupResult};
         let report = ExecuteReport {
             groups: vec![
                 GroupResult {
@@ -1003,6 +1710,7 @@ mod tests {
                     }],
                     sidecar_outcome: Some(TransferOutcome::Transferred),
                     deleted_from_source: true,
+                    destination: Some(PathBuf::from("/dest/kept")),
                 },
                 GroupResult {
                     group_name: "broken".to_string(),
@@ -1013,9 +1721,11 @@ mod tests {
                     }],
                     sidecar_outcome: None,
                     deleted_from_source: false,
+                    destination: Some(PathBuf::from("/dest/broken")),
                 },
             ],
             deletion_skipped_reason: None,
+            delete_source: true,
         };
 
         let json = results_to_json(&report);
@@ -1029,10 +1739,10 @@ mod tests {
 
     #[test]
     fn results_json_serializes_to_valid_json() {
-        use crate::transfer::ExecuteReport;
         let report = ExecuteReport {
             groups: vec![],
             deletion_skipped_reason: Some("declined".to_string()),
+            delete_source: true,
         };
         let json = results_to_json(&report);
         let value = serde_json::to_value(&json).unwrap();

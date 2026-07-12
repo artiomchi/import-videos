@@ -628,6 +628,57 @@ fn disabled_quarantine_copy_source_not_deleted_even_with_delete_source() {
     assert!(!quarantine_group.deleted_from_source);
 }
 
+// --- Diagnostics on stderr, never stdout (improve-console-output design D8, task 3.3) ---
+
+#[test]
+fn warning_under_json_mode_stays_off_stdout_and_stdout_is_one_document() {
+    // A garbage chapter file makes `chapter_civil_time` fail to read an
+    // MVHD creation time and fall back to the file's mtime, firing
+    // `tracing::warn!` mid-scan — exactly the case the JSON-mode
+    // contract ("no other stdout output") must survive.
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("card");
+    write_file(
+        &source_dir.join("DCIM/100GOPRO/GX010001.MP4"),
+        b"not an mp4 at all",
+    );
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            "profiles:\n  cam:\n    type: gopro\n    require_marker: false\n    source: auto\n    destination: {}\n    layout: \"{{date:%Y}}/{{date:%Y-%m-%d}}\"\n",
+            dest.display()
+        ),
+    );
+
+    let output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "scan",
+            "cam",
+            "--source",
+            source_dir.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str::<serde_json::Value>(&stdout)
+        .unwrap_or_else(|e| panic!("stdout must be exactly one JSON document: {e}\n{stdout}"));
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("could not read camera-clock creation time"),
+        "warning must appear on stderr, got: {stderr}"
+    );
+}
+
 // --- Quick-match tests (tasks 7.2-7.4) ---
 
 /// Stamps a file's mtime to the given `jiff::Timestamp` (mirrors
