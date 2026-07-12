@@ -222,6 +222,70 @@ fn scan_and_dry_run_are_read_only() {
     assert_eq!(tree_snapshot(&card), card_before);
 }
 
+// --- add-scan-progress: piped/--json output stays clean ---
+
+#[test]
+fn piped_scan_and_dry_run_import_produce_no_progress_bytes() {
+    // Spec: "Piped or JSON output stays clean" — a `Command::output()`
+    // capture is inherently non-interactive (stdout is a pipe, not a
+    // TTY), so the scan-phase `Progress` must construct no bar and the
+    // captured stdout must carry no escape/terminal-control bytes,
+    // whether or not `--json` is also passed.
+    let dir = tempfile::tempdir().unwrap();
+    let card = dir.path().join("card");
+    let creation_time = creation_time_2026_07_09();
+    write_chapter(
+        &card.join("DCIM/100GOPRO/GX010123.MP4"),
+        creation_time,
+        &[5000],
+    );
+
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    gopro_config(&config_path, &dest, "");
+
+    for extra_args in [vec![], vec!["--json".to_string()]] {
+        let mut args = vec![
+            "--config".to_string(),
+            config_path.to_str().unwrap().to_string(),
+            "scan".to_string(),
+            "gopro".to_string(),
+            "--source".to_string(),
+            card.to_str().unwrap().to_string(),
+        ];
+        args.extend(extra_args.clone());
+        let scan_output = bin().args(&args).stdin(Stdio::null()).output().unwrap();
+        assert_eq!(scan_output.status.code(), Some(0));
+        assert!(
+            !scan_output.stdout.contains(&0x1b),
+            "scan stdout must carry no escape/terminal-control bytes when piped: {:?}",
+            String::from_utf8_lossy(&scan_output.stdout)
+        );
+
+        let mut import_args = vec![
+            "--config".to_string(),
+            config_path.to_str().unwrap().to_string(),
+            "import".to_string(),
+            "gopro".to_string(),
+            "--source".to_string(),
+            card.to_str().unwrap().to_string(),
+            "--dry-run".to_string(),
+        ];
+        import_args.extend(extra_args);
+        let dry_run_output = bin()
+            .args(&import_args)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(dry_run_output.status.code(), Some(0));
+        assert!(
+            !dry_run_output.stdout.contains(&0x1b),
+            "import --dry-run stdout must carry no escape/terminal-control bytes when piped: {:?}",
+            String::from_utf8_lossy(&dry_run_output.stdout)
+        );
+    }
+}
+
 // --- 4.3: a corrupt chapter degrades to quarantine, not a failed run ---
 
 #[test]

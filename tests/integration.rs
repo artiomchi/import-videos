@@ -18,6 +18,7 @@ use std::process::{Command, Stdio};
 use import_videos::config::{LayoutTemplate, Profile, SourceKind, SourceLocation};
 use import_videos::error;
 use import_videos::plan::{self, ImportPlan};
+use import_videos::progress::Progress;
 use import_videos::source::{ImportSource, MediaFile, MediaGroup, ScanContext, Verdict};
 use import_videos::transfer::{self, TransferOutcome};
 
@@ -131,6 +132,7 @@ fn scan_and_dry_run_perform_no_filesystem_changes() {
         &source_impl,
         &dir.path().join("source"),
         &jiff::tz::TimeZone::UTC,
+        &Progress::hidden(),
     )
     .unwrap();
 
@@ -169,6 +171,7 @@ fn execution_follows_the_plan() {
         &source_impl,
         Path::new("/ignored"),
         &jiff::tz::TimeZone::UTC,
+        &Progress::hidden(),
     )
     .unwrap();
 
@@ -178,7 +181,7 @@ fn execution_follows_the_plan() {
         false,
         false,
         false,
-        &transfer::Progress::hidden(),
+        &Progress::hidden(),
     )
     .unwrap();
 
@@ -248,7 +251,7 @@ fn transfer_failure_keeps_source_and_does_not_block_other_groups() {
         false,
         false,
         false,
-        &transfer::Progress::hidden(),
+        &Progress::hidden(),
     )
     .unwrap();
 
@@ -312,6 +315,7 @@ fn rerunning_import_is_idempotent() {
             &source_impl,
             Path::new("/ignored"),
             &jiff::tz::TimeZone::UTC,
+            &Progress::hidden(),
         )
         .unwrap()
     };
@@ -322,7 +326,7 @@ fn rerunning_import_is_idempotent() {
         false,
         false,
         false,
-        &transfer::Progress::hidden(),
+        &Progress::hidden(),
     )
     .unwrap();
     assert!(matches!(
@@ -338,7 +342,7 @@ fn rerunning_import_is_idempotent() {
         false,
         false,
         false,
-        &transfer::Progress::hidden(),
+        &Progress::hidden(),
     )
     .unwrap();
     assert!(matches!(
@@ -371,6 +375,7 @@ fn different_content_at_destination_gets_suffixed() {
         &source_impl,
         Path::new("/ignored"),
         &jiff::tz::TimeZone::UTC,
+        &Progress::hidden(),
     )
     .unwrap();
 
@@ -380,7 +385,7 @@ fn different_content_at_destination_gets_suffixed() {
         false,
         false,
         false,
-        &transfer::Progress::hidden(),
+        &Progress::hidden(),
     )
     .unwrap();
 
@@ -410,6 +415,7 @@ fn keep_source_flag_overrides_delete_source() {
         &source_impl,
         Path::new("/ignored"),
         &jiff::tz::TimeZone::UTC,
+        &Progress::hidden(),
     )
     .unwrap();
 
@@ -420,7 +426,7 @@ fn keep_source_flag_overrides_delete_source() {
         true,
         true,
         false,
-        &transfer::Progress::hidden(),
+        &Progress::hidden(),
     )
     .unwrap();
 
@@ -445,18 +451,12 @@ fn delete_source_removes_file_after_confirmed_transfer() {
         &source_impl,
         Path::new("/ignored"),
         &jiff::tz::TimeZone::UTC,
+        &Progress::hidden(),
     )
     .unwrap();
 
-    let report = transfer::execute(
-        &import_plan,
-        true,
-        false,
-        true,
-        false,
-        &transfer::Progress::hidden(),
-    )
-    .unwrap();
+    let report =
+        transfer::execute(&import_plan, true, false, true, false, &Progress::hidden()).unwrap();
 
     assert!(report.groups[0].deleted_from_source);
     assert!(!src.exists());
@@ -606,6 +606,7 @@ fn disabled_quarantine_copy_leaves_source_and_creates_no_dir() {
         &source_impl,
         Path::new("/ignored"),
         &jiff::tz::TimeZone::UTC,
+        &Progress::hidden(),
     )
     .unwrap();
     let report = transfer::execute(
@@ -614,7 +615,7 @@ fn disabled_quarantine_copy_leaves_source_and_creates_no_dir() {
         false,
         false,
         false,
-        &transfer::Progress::hidden(),
+        &Progress::hidden(),
     )
     .unwrap();
 
@@ -681,18 +682,12 @@ fn disabled_quarantine_copy_source_not_deleted_even_with_delete_source() {
         &source_impl,
         Path::new("/ignored"),
         &jiff::tz::TimeZone::UTC,
+        &Progress::hidden(),
     )
     .unwrap();
     // assume_yes = true to skip the interactive prompt.
-    let report = transfer::execute(
-        &import_plan,
-        true,
-        false,
-        true,
-        false,
-        &transfer::Progress::hidden(),
-    )
-    .unwrap();
+    let report =
+        transfer::execute(&import_plan, true, false, true, false, &Progress::hidden()).unwrap();
 
     // The Keep group's source is deleted after a verified transfer.
     assert!(
@@ -777,18 +772,12 @@ fn quick_match_hit_skips_hashing_and_reports_distinct_outcome() {
         &source_impl,
         Path::new("/ignored"),
         &jiff::tz::TimeZone::UTC,
+        &Progress::hidden(),
     )
     .unwrap();
 
-    let report = transfer::execute(
-        &import_plan,
-        false,
-        false,
-        false,
-        true,
-        &transfer::Progress::hidden(),
-    )
-    .unwrap();
+    let report =
+        transfer::execute(&import_plan, false, false, false, true, &Progress::hidden()).unwrap();
 
     assert_eq!(
         report.groups[0].files[0].outcome,
@@ -826,18 +815,12 @@ fn quick_match_miss_on_size_difference_falls_through_to_verified_transfer() {
         &source_impl,
         Path::new("/ignored"),
         &jiff::tz::TimeZone::UTC,
+        &Progress::hidden(),
     )
     .unwrap();
 
-    let report = transfer::execute(
-        &import_plan,
-        false,
-        false,
-        false,
-        true,
-        &transfer::Progress::hidden(),
-    )
-    .unwrap();
+    let report =
+        transfer::execute(&import_plan, false, false, false, true, &Progress::hidden()).unwrap();
 
     // Size mismatch → miss → falls through to full verified transfer; content
     // differs from destination, so it gets suffixed.
@@ -878,19 +861,13 @@ fn fully_quick_matched_group_is_never_deleted_even_with_delete_source_and_yes() 
         &source_impl,
         Path::new("/ignored"),
         &jiff::tz::TimeZone::UTC,
+        &Progress::hidden(),
     )
     .unwrap();
 
     // delete_source=true, assume_yes=true, quick_match=true
-    let report = transfer::execute(
-        &import_plan,
-        true,
-        false,
-        true,
-        true,
-        &transfer::Progress::hidden(),
-    )
-    .unwrap();
+    let report =
+        transfer::execute(&import_plan, true, false, true, true, &Progress::hidden()).unwrap();
 
     // The group must be SkippedQuickMatch (not content-verified).
     assert_eq!(

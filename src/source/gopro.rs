@@ -16,6 +16,7 @@ use serde_json::json;
 
 use crate::error::Result;
 use crate::media::{gpmf, mp4};
+use crate::progress::Progress;
 use crate::source::sidecar::{self, EventEntry, SidecarEnvelope};
 use crate::source::{ImportSource, Marker, MediaFile, MediaGroup, ScanContext, Verdict};
 
@@ -50,6 +51,14 @@ impl ImportSource for GoproSource {
     fn scan(&self, root: &Path, ctx: &ScanContext) -> Result<Vec<(MediaGroup, Verdict)>> {
         let (sessions, unrecognized) = discover(&root.join("DCIM"), ctx.ignore);
 
+        // Total is known up front from discover()'s chapter count, before
+        // any per-chapter parsing starts (add-scan-progress design D1).
+        let total_chapters: u64 = sessions
+            .values()
+            .map(|chapters| chapters.len() as u64)
+            .sum();
+        ctx.progress.set_length(total_chapters);
+
         let mut groups = Vec::with_capacity(sessions.len() + 1);
         let mut session_ids: Vec<&String> = sessions.keys().collect();
         session_ids.sort();
@@ -59,6 +68,8 @@ impl ImportSource for GoproSource {
             chapters.sort_by_key(|(chapter, _)| *chapter);
             groups.push(self.build_session(session_id, &chapters, ctx));
         }
+
+        ctx.progress.finish();
 
         if !unrecognized.is_empty() {
             groups.push((
@@ -115,7 +126,17 @@ impl GoproSource {
             .map(|&dt| civil_to_instant(dt, ctx.tz))
             .collect();
 
-        let session_offset = derive_session_offset(chapters, &chapter_times, &mut telemetry);
+        let (session_offset, visited) = derive_session_offset(
+            session_id,
+            chapters,
+            &chapter_times,
+            &mut telemetry,
+            ctx.progress,
+        );
+        // Chapters the GPS search never reached (a fix was already found,
+        // or the session has no telemetry at all) still count as visited
+        // for progress purposes — one tick per chapter, total (design D3).
+        ctx.progress.inc(chapters.len() as u64 - visited as u64);
 
         let mut all_markers: Vec<MarkerHit> = Vec::new();
         for (i, (_, path)) in chapters.iter().enumerate() {
@@ -360,13 +381,24 @@ fn open_chapter_telemetry(path: &Path) -> Option<ChapterTelemetry> {
 /// session-wide. A parse failure on one chapter's telemetry is logged
 /// and treated the same as that chapter having none, so a later
 /// chapter can still supply the offset (spec: "Offset from a later
-/// chapter").
+/// chapter"). Reports progress as it goes (add-scan-progress design
+/// D3): every iteration the loop *executes* ticks the bar exactly
+/// once, before any of its `continue`s, since this is the one place
+/// scan cost is actually unbounded. Returns the offset alongside the
+/// number of chapters visited (`i + 1` on an early return at index `i`,
+/// `chapters.len()` if the loop exhausts without a fix) — exactly the
+/// tick count already emitted, by construction.
 fn derive_session_offset(
+    session_id: &str,
     chapters: &[(u32, PathBuf)],
     chapter_times: &[Timestamp],
     telemetry: &mut [Option<ChapterTelemetry>],
-) -> Option<SessionTelemetry> {
+    progress: &Progress,
+) -> (Option<SessionTelemetry>, usize) {
     for (i, (_, path)) in chapters.iter().enumerate() {
+        progress.inc(1);
+        progress.set_message(format!("session {session_id}: {}", file_name(path)));
+
         let Some(chapter_telemetry) = telemetry[i].as_mut() else {
             continue;
         };
@@ -390,12 +422,15 @@ fn derive_session_offset(
 
         let reference = chapter_times[i] + span_from_secs(sample.time_s);
         let offset_s = utc.duration_since(reference).as_secs_f64();
-        return Some(SessionTelemetry {
-            offset_s,
-            geo: (gps_sample.lat, gps_sample.lon),
-        });
+        return (
+            Some(SessionTelemetry {
+                offset_s,
+                geo: (gps_sample.lat, gps_sample.lon),
+            }),
+            i + 1,
+        );
     }
-    None
+    (None, chapters.len())
 }
 
 /// Finds coordinates for a marker at `offset_s` (its chapter's stream
@@ -619,15 +654,17 @@ fn chapter_markers(path: &Path) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress::Progress;
     use crate::source::ScanContext;
 
     /// A deterministic `ScanContext` for tests: UTC zone, epoch
     /// imported_at, empty ignore set.
-    fn test_ctx_with_tz(tz: TimeZone) -> (globset::GlobSet, TimeZone, Timestamp) {
+    fn test_ctx_with_tz(tz: TimeZone) -> (globset::GlobSet, TimeZone, Timestamp, Progress) {
         (
             globset::GlobSetBuilder::new().build().unwrap(),
             tz,
             Timestamp::UNIX_EPOCH,
+            Progress::hidden(),
         )
     }
 
@@ -635,11 +672,13 @@ mod tests {
         ignore: &'a globset::GlobSet,
         tz: &'a TimeZone,
         imported_at: Timestamp,
+        progress: &'a Progress,
     ) -> ScanContext<'a> {
         ScanContext {
             ignore,
             tz,
             imported_at,
+            progress,
         }
     }
 
@@ -704,8 +743,8 @@ mod tests {
         let chapter = dir.path().join("GX010124.MP4");
         fs::write(&chapter, b"").unwrap();
 
-        let (ignore, tz, imported_at) = test_ctx_with_tz(TimeZone::UTC);
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (group, verdict) = source.build_session("0124", &[(1, chapter)], &ctx);
         assert_eq!(verdict, Verdict::Keep);
         assert!(group.markers.is_empty());
@@ -1015,8 +1054,8 @@ mod tests {
         let source = GoproSource {
             require_marker: true,
         };
-        let (ignore, tz, imported_at) = test_ctx_with_tz(TimeZone::UTC);
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (group, verdict) = source.build_session("0001", &[(1, chapter)], &ctx);
 
         assert_eq!(verdict, Verdict::Keep);
@@ -1064,8 +1103,8 @@ mod tests {
         let source = GoproSource {
             require_marker: false,
         };
-        let (ignore, tz, imported_at) = test_ctx_with_tz(TimeZone::UTC);
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (group, _) = source.build_session("0002", &[(1, chapter1), (2, chapter2)], &ctx);
 
         // offset = GPSU(01:00:00) - (chapter2 mvhd 02:00:12 + 0s) = -3612s
@@ -1094,8 +1133,8 @@ mod tests {
         let source = GoproSource {
             require_marker: true,
         };
-        let (ignore, tz, imported_at) = test_ctx_with_tz(TimeZone::UTC);
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (group, _) = source.build_session("0003", &[(1, chapter)], &ctx);
 
         let sidecar = group.sidecar.unwrap();
@@ -1125,8 +1164,8 @@ mod tests {
         let source = GoproSource {
             require_marker: true,
         };
-        let (ignore, tz, imported_at) = test_ctx_with_tz(TimeZone::UTC);
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
 
         let (gps_group, _) = source.build_session("0004", &[(1, gps_chapter)], &ctx);
         let gps_sidecar = gps_group.sidecar.unwrap();
@@ -1153,5 +1192,53 @@ mod tests {
         // Camera events also use "time" (unified field).
         assert!(camera_sidecar.content["events"][0].get("time").is_some());
         assert!(camera_group.geo.is_none());
+    }
+
+    // --- scan progress (add-scan-progress design D1, D3) ---
+
+    #[test]
+    fn scan_progress_reaches_total_chapter_count() {
+        // Every chapter discover() counts must tick the bar exactly once,
+        // regardless of where (or whether) each session's GPS search
+        // stopped: session 0001's search exhausts both its chapters
+        // without a fix (ticks entirely from the per-iteration loop in
+        // `derive_session_offset`); session 0002 finds a fix on its first
+        // chapter, so the second chapter is only ticked via the 3.3
+        // catch-up increment in `build_session`.
+        let dir = tempfile::tempdir().unwrap();
+        let dcim = dir.path().join("DCIM/100GOPRO");
+        fs::create_dir_all(&dcim).unwrap();
+
+        write_chapter(&dcim.join("GX010001.MP4"), "2026-07-10T00:00:00Z", &[], &[]);
+        write_chapter(&dcim.join("GX020001.MP4"), "2026-07-10T00:01:00Z", &[], &[]);
+
+        let payload = gps_payload(
+            Some("2026-07-10T00:00:00Z"),
+            true,
+            &[[515_012_340, -1_234_567, 100_000, 0, 0]],
+        );
+        write_chapter(
+            &dcim.join("GX010002.MP4"),
+            "2026-07-10T00:00:00Z",
+            &[],
+            &[payload],
+        );
+        write_chapter(&dcim.join("GX020002.MP4"), "2026-07-10T00:01:00Z", &[], &[]);
+
+        let source = GoproSource {
+            require_marker: false,
+        };
+        let progress = Progress::counted(true);
+        let (ignore, tz, imported_at, _hidden) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
+
+        let groups = source.scan(dir.path(), &ctx).unwrap();
+        assert_eq!(groups.len(), 2, "both sessions should produce a group");
+        assert_eq!(
+            progress.position(),
+            4,
+            "one tick per discovered chapter, whether examined during the \
+             GPS search or ticked in the post-search catch-up"
+        );
     }
 }

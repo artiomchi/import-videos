@@ -505,6 +505,7 @@ fn file_name(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::progress::Progress;
     use crate::source::ScanContext;
 
     fn write(path: &Path, contents: &str) {
@@ -524,11 +525,12 @@ mod tests {
 
     /// A deterministic `ScanContext` for tests: UTC zone, epoch
     /// `imported_at`, empty ignore set.
-    fn test_ctx_parts() -> (globset::GlobSet, TimeZone, Timestamp) {
+    fn test_ctx_parts() -> (globset::GlobSet, TimeZone, Timestamp, Progress) {
         (
             globset::GlobSetBuilder::new().build().unwrap(),
             TimeZone::UTC,
             Timestamp::UNIX_EPOCH,
+            Progress::hidden(),
         )
     }
 
@@ -536,11 +538,13 @@ mod tests {
         ignore: &'a globset::GlobSet,
         tz: &'a TimeZone,
         imported_at: Timestamp,
+        progress: &'a Progress,
     ) -> ScanContext<'a> {
         ScanContext {
             ignore,
             tz,
             imported_at,
+            progress,
         }
     }
 
@@ -583,8 +587,8 @@ mod tests {
         write(&event_dir.join("2026-07-04_18-18-32-front.mp4"), "front");
         write(&event_dir.join("2026-07-04_18-18-32-back.mp4"), "back");
 
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (group, verdict) = source(default_events(), None).build_event_group(
             EventCategory::Saved,
             &event_dir,
@@ -609,8 +613,8 @@ mod tests {
             &event_json("sentry_aware_object_detection"),
         );
 
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (_, verdict) = source(vec![EventCategory::Saved], None).build_event_group(
             EventCategory::Sentry,
             &event_dir,
@@ -632,8 +636,8 @@ mod tests {
         );
 
         let reasons = Reasons::Deny(vec!["sentry_aware_object_detection".to_string()]);
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (_, verdict) = source(default_events(), Some(reasons)).build_event_group(
             EventCategory::Sentry,
             &event_dir,
@@ -655,8 +659,8 @@ mod tests {
         );
 
         let reasons = Reasons::Allow(vec!["user_interaction_honk".to_string()]);
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (_, verdict) = source(default_events(), Some(reasons)).build_event_group(
             EventCategory::Sentry,
             &event_dir,
@@ -675,8 +679,8 @@ mod tests {
         );
 
         let reasons = Reasons::Allow(vec!["user_interaction_honk".to_string()]);
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (_, verdict) = source(default_events(), Some(reasons)).build_event_group(
             EventCategory::Saved,
             &event_dir,
@@ -691,8 +695,8 @@ mod tests {
         let event_dir = dir.path().join("TeslaCam/SavedClips/2026-07-04_18-23-51");
         write(&event_dir.join("event.json"), "{not valid json");
 
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (group, verdict) = source(default_events(), None).build_event_group(
             EventCategory::Saved,
             &event_dir,
@@ -711,8 +715,8 @@ mod tests {
         let event_dir = dir.path().join("TeslaCam/SavedClips/not-a-timestamp");
         write(&event_dir.join("event.json"), "{not valid json");
 
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (_, verdict) = source(default_events(), None).build_event_group(
             EventCategory::Saved,
             &event_dir,
@@ -733,8 +737,8 @@ mod tests {
             &event_json("user_interaction_honk"),
         );
 
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (group, _) = source(default_events(), None).build_event_group(
             EventCategory::Saved,
             &event_dir,
@@ -751,8 +755,8 @@ mod tests {
         let recent = dir.path().join("TeslaCam/RecentClips");
         write(&recent.join("2026-07-04_18-40-00-front.mp4"), "front");
 
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let groups = source(default_events(), None)
             .scan(dir.path(), &ctx)
             .unwrap();
@@ -776,8 +780,8 @@ mod tests {
 
         let mut events = default_events();
         events.push(EventCategory::Recent);
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let groups = source(events, None).scan(dir.path(), &ctx).unwrap();
 
         assert_eq!(groups.len(), 2);
@@ -793,8 +797,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write(&dir.path().join("TeslaCam/SavedClips/stray.mp4"), "stray");
 
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let groups = source(default_events(), None)
             .scan(dir.path(), &ctx)
             .unwrap();
@@ -817,8 +821,8 @@ mod tests {
         );
         write(&event_dir.join("notes.txt"), "notes");
 
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let (group, verdict) = source(default_events(), None).build_event_group(
             EventCategory::Saved,
             &event_dir,
@@ -861,8 +865,8 @@ mod tests {
         write(&dir.path().join("TeslaCam/SavedClips/stray.mp4"), "stray");
 
         let reasons = Reasons::Deny(vec!["sentry_aware_object_detection".to_string()]);
-        let (ignore, tz, imported_at) = test_ctx_parts();
-        let ctx = make_ctx(&ignore, &tz, imported_at);
+        let (ignore, tz, imported_at, progress) = test_ctx_parts();
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
         let groups = source(vec![EventCategory::Saved], Some(reasons))
             .scan(dir.path(), &ctx)
             .unwrap();

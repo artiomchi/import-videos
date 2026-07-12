@@ -10,74 +10,14 @@ use std::fs::{self, File};
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 
-use indicatif::{ProgressBar, ProgressStyle};
 use jiff::Timestamp;
 
 use crate::error::{Error, Result};
 use crate::plan::ImportPlan;
+use crate::progress::Progress;
 use crate::source::{Sidecar, Verdict};
 
 const BUF_SIZE: usize = 64 * 1024;
-
-/// Byte-level transfer progress (design D6): a thin wrapper around an
-/// `Option<ProgressBar>` so every call site can tick unconditionally —
-/// `hidden()` (piped stdout, `--json`, or tests) makes every method a
-/// no-op, with nothing constructed or drawn.
-pub struct Progress {
-    bar: Option<ProgressBar>,
-}
-
-impl Progress {
-    /// `enabled` should be `stdout is a TTY && !--json` — decided once
-    /// by the CLI layer, never re-checked here (design D6).
-    pub fn new(enabled: bool) -> Self {
-        if !enabled {
-            return Progress { bar: None };
-        }
-        let bar = ProgressBar::new(0);
-        bar.set_style(
-            ProgressStyle::with_template(
-                "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} {msg}",
-            )
-            .unwrap_or_else(|_| ProgressStyle::default_bar())
-            .progress_chars("#>-"),
-        );
-        Progress { bar: Some(bar) }
-    }
-
-    pub fn hidden() -> Self {
-        Progress { bar: None }
-    }
-
-    fn set_length(&self, len: u64) {
-        if let Some(bar) = &self.bar {
-            bar.set_length(len);
-        }
-    }
-
-    fn set_message(&self, msg: String) {
-        if let Some(bar) = &self.bar {
-            bar.set_message(msg);
-        }
-    }
-
-    fn inc(&self, delta: u64) {
-        if let Some(bar) = &self.bar {
-            bar.inc(delta);
-        }
-    }
-
-    fn finish(&self) {
-        if let Some(bar) = &self.bar {
-            bar.finish_and_clear();
-        }
-    }
-
-    #[cfg(test)]
-    fn position(&self) -> u64 {
-        self.bar.as_ref().map(|b| b.position()).unwrap_or(0)
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransferOutcome {
@@ -939,63 +879,10 @@ mod tests {
     }
 
     // --- progress (design D6, task 5.4) ---
-
-    #[test]
-    fn hidden_progress_never_constructs_a_bar() {
-        // Task 5.4: piped/JSON output must carry no progress or
-        // terminal-control bytes. `Progress::hidden()` never allocates
-        // an indicatif `ProgressBar`, so every method is an inert no-op
-        // by construction — this exercises the full call surface
-        // (set_length/set_message/inc/finish, via a real transfer) to
-        // pin that none of it panics or depends on a live bar.
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("clip.mp4");
-        fs::write(&src, b"hello world").unwrap();
-        let dest_dir = dir.path().join("dest");
-
-        let group = MediaGroup {
-            name: "a".to_string(),
-            files: vec![MediaFile {
-                path: src.clone(),
-                size: 11,
-                recorded_at: None,
-            }],
-            timestamp: ts(0),
-            markers: vec![],
-            geo: None,
-            context: HashMap::new(),
-            sidecar: None,
-        };
-        let plan = ImportPlan {
-            actions: vec![PlannedAction {
-                group,
-                verdict: Verdict::Keep,
-                destination: Some(dest_dir.clone()),
-                quarantine_path: None,
-            }],
-        };
-
-        let report = execute(&plan, false, false, false, false, &Progress::hidden()).unwrap();
-        assert!(matches!(
-            report.groups[0].files[0].outcome,
-            TransferOutcome::Transferred
-        ));
-    }
-
-    #[test]
-    fn visible_progress_bar_can_be_constructed_and_used() {
-        // Confirms `Progress::new(true)` builds a real bar without
-        // panicking on the template string, and that ticking it
-        // through a real transfer doesn't error.
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("clip.mp4");
-        fs::write(&src, b"hello world").unwrap();
-        let dest_dir = dir.path().join("dest");
-
-        let progress = Progress::new(true);
-        let outcome = transfer_file(&src, &dest_dir, None, false, &progress).unwrap();
-        assert_eq!(outcome, TransferOutcome::Transferred);
-    }
+    //
+    // `Progress`'s own construction/no-op behavior is unit-tested in
+    // `src/progress.rs`; the tests below exercise it through real
+    // transfers, where its bookkeeping actually matters.
 
     #[test]
     fn skipped_identical_still_advances_progress_by_full_size() {

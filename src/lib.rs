@@ -9,6 +9,7 @@ pub mod error;
 pub mod inspect;
 pub mod media;
 pub mod plan;
+pub mod progress;
 pub mod report;
 pub mod source;
 pub mod transfer;
@@ -101,12 +102,15 @@ fn get_profile<'a>(cfg: &'a config::Config, name: &str) -> Result<&'a config::Pr
 
 /// Resolves a source and builds a plan for `profile_name`, handling the
 /// two "nothing to do" cases (`scan` and `import` share this exactly:
-/// spec requires `import` build "the same plan `scan` would").
+/// spec requires `import` build "the same plan `scan` would"). `scan_progress`
+/// reports the scan phase's progress (add-scan-progress design D1, D4) — its
+/// enabled/hidden state is decided once by the caller, never re-derived here.
 /// `Ok(None)` means the caller should report "nothing found" and stop.
 fn scan_profile(
     cfg: &config::Config,
     profile_name: &str,
     source_override: Option<&Path>,
+    scan_progress: &progress::Progress,
 ) -> Result<Option<plan::ImportPlan>> {
     let profile = get_profile(cfg, profile_name)?;
     let source_impl = profile.kind.build();
@@ -121,7 +125,13 @@ fn scan_profile(
         return Ok(None);
     };
 
-    let import_plan = plan::build_plan(profile, source_impl.as_ref(), &root, &cfg.timezone)?;
+    let import_plan = plan::build_plan(
+        profile,
+        source_impl.as_ref(),
+        &root,
+        &cfg.timezone,
+        scan_progress,
+    )?;
     if import_plan.actions.is_empty() {
         return Ok(None);
     }
@@ -157,6 +167,14 @@ fn print_plan(plan: &plan::ImportPlan, verbose: bool, tz: &jiff::tz::TimeZone, j
     }
 }
 
+/// Progress bars are visible only on an interactive terminal with
+/// JSON output off (design D6) — never interleaved with piped or
+/// machine-readable output. Decided once per command and threaded
+/// down, never re-derived (add-scan-progress design D4).
+fn scan_progress_enabled(json: bool) -> bool {
+    std::io::stdout().is_terminal() && !json
+}
+
 fn run_scan(
     cfg: &config::Config,
     profile_name: &str,
@@ -164,7 +182,8 @@ fn run_scan(
     verbose: bool,
     json: bool,
 ) -> Result<ExitCode> {
-    match scan_profile(cfg, profile_name, source_override)? {
+    let scan_progress = progress::Progress::counted(scan_progress_enabled(json));
+    match scan_profile(cfg, profile_name, source_override, &scan_progress)? {
         None => print_no_sources(profile_name, json),
         Some(import_plan) => print_plan(&import_plan, verbose, &cfg.timezone, json),
     }
@@ -185,7 +204,9 @@ fn run_import(
 ) -> Result<ExitCode> {
     let profile = get_profile(cfg, profile_name)?;
 
-    let Some(import_plan) = scan_profile(cfg, profile_name, source_override)? else {
+    let scan_progress = progress::Progress::counted(scan_progress_enabled(json));
+    let Some(import_plan) = scan_profile(cfg, profile_name, source_override, &scan_progress)?
+    else {
         print_no_sources(profile_name, json);
         return Ok(ExitCode::Success);
     };
@@ -195,10 +216,10 @@ fn run_import(
         return Ok(ExitCode::Success);
     }
 
-    // Progress bars are visible only on an interactive terminal with
-    // JSON output off (design D6) — never interleaved with piped or
-    // machine-readable output.
-    let progress = transfer::Progress::new(std::io::stdout().is_terminal() && !json);
+    // A separate, byte-oriented Progress for the transfer phase (design
+    // D6), built after scanning completes — the scan bar has already
+    // finished and cleared by this point (add-scan-progress design D5).
+    let progress = progress::Progress::new(scan_progress_enabled(json));
 
     let exec_report = transfer::execute(
         &import_plan,

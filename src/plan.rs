@@ -9,6 +9,7 @@ use jiff::Timestamp;
 
 use crate::config::{Profile, SourceLocation};
 use crate::error::{Error, Result};
+use crate::progress::Progress;
 use crate::source::{ImportSource, MediaGroup, ScanContext, Verdict};
 
 /// A `MediaGroup` paired with its verdict and fully resolved
@@ -90,11 +91,13 @@ pub fn build_plan(
     source_impl: &dyn ImportSource,
     source_root: &Path,
     timezone: &jiff::tz::TimeZone,
+    progress: &Progress,
 ) -> Result<ImportPlan> {
     let ctx = ScanContext {
         ignore: &profile.ignore,
         tz: timezone,
         imported_at: Timestamp::now(),
+        progress,
     };
     let groups = source_impl.scan(source_root, &ctx)?;
     let mut actions = Vec::with_capacity(groups.len());
@@ -191,7 +194,14 @@ mod tests {
         let source = StubSource {
             groups: vec![(quarantine_group(), Verdict::Quarantine)],
         };
-        let plan = build_plan(&prof, &source, Path::new("/src"), &jiff::tz::TimeZone::UTC).unwrap();
+        let plan = build_plan(
+            &prof,
+            &source,
+            Path::new("/src"),
+            &jiff::tz::TimeZone::UTC,
+            &Progress::hidden(),
+        )
+        .unwrap();
         let action = &plan.actions[0];
         assert!(
             action.quarantine_path.is_some(),
@@ -209,7 +219,14 @@ mod tests {
         let source = StubSource {
             groups: vec![(quarantine_group(), Verdict::Quarantine)],
         };
-        let plan = build_plan(&prof, &source, Path::new("/src"), &jiff::tz::TimeZone::UTC).unwrap();
+        let plan = build_plan(
+            &prof,
+            &source,
+            Path::new("/src"),
+            &jiff::tz::TimeZone::UTC,
+            &Progress::hidden(),
+        )
+        .unwrap();
         let action = &plan.actions[0];
         assert_eq!(
             action.quarantine_path, None,

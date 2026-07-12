@@ -181,10 +181,14 @@ import-videos scan commute
 import-videos import commute
 ```
 
-On multi-GB transfers, `import` shows a byte-level progress bar while stdout
-is an interactive terminal and `--json` is off; it's silent (no progress, no
-terminal-control bytes) when stdout is piped or `--json` is set, so scripted
-and redirected runs stay clean.
+Both `scan` and `import` show a per-chapter/session scan-phase progress
+indicator while a card is being read, appearing before the plan is printed
+and clearing once scanning finishes. `import` additionally shows a byte-level
+progress bar for the transfer phase, after the plan is built — the two never
+appear at once. Both are shown only while stdout is an interactive terminal
+and `--json` is off; either is silent (no progress, no terminal-control
+bytes) when stdout is piped or `--json` is set, so scripted and redirected
+runs stay clean.
 
 Useful flags:
 
