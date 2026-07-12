@@ -65,15 +65,26 @@ The `import` command SHALL build the same plan `scan` would and execute it. With
 - **THEN** afterwards A's files exist under the resolved destination, B's files exist under the quarantine path, and nothing else changed
 
 ### Requirement: Verified transfer with atomic finalization
-For each kept file the system SHALL stream-copy to a temporary name (`<final>.part`) in the destination directory while hashing the source (blake3), then hash the written temporary file, and only on hash match rename it to the final name. On mismatch or copy failure the temporary file MUST be removed and the source file left untouched.
+
+For each kept file whose final destination name is unoccupied, the system SHALL read the source exactly once, hashing it (blake3) while stream-copying to a temporary name (`<final>.part`) in the destination directory. The system SHALL then re-read and hash the written temporary file, and only when the read-back hash matches the source stream hash rename it to the final name — so a copy corrupted or truncated in the write path fails verification rather than being finalized. On mismatch or copy failure the temporary file MUST be removed and the source file left untouched.
+
+When the final destination name is already occupied, the system MAY hash the source in a separate pass before copying, in order to resolve the collision without a copy (see "Collisions never overwrite existing footage"); a copy that follows an unresolved collision SHALL use the same single-pass stream-copy and read-back verification at the suffixed name.
 
 #### Scenario: Successful verified copy
-- **WHEN** a file is transferred and both hashes match
+- **WHEN** a file is transferred and the written temporary file's read-back hash matches the source stream hash
 - **THEN** the file exists under its final destination name and no `.part` file remains
 
 #### Scenario: Verification failure preserves the source
-- **WHEN** the destination hash differs from the source hash
+- **WHEN** the written temporary file's read-back hash differs from the source stream hash
 - **THEN** the temporary file is deleted, the source file remains, and the action is reported as failed
+
+#### Scenario: Source is read once when no collision exists
+- **WHEN** a kept file's final destination name is unoccupied
+- **THEN** the source file is read exactly once during its transfer
+
+#### Scenario: Write-path corruption is detected
+- **WHEN** the bytes persisted in the temporary file differ from the bytes streamed from the source
+- **THEN** verification fails, the temporary file is removed, and the source file is untouched
 
 ### Requirement: Source deletion only after verification
 When the effective `delete_source` is `true` — the profile's value unless overridden for the run by `--delete-source` or `--no-delete-source` — the system SHALL delete a source file only after its verified transfer completed or the file was confirmed already-imported by content hashing. A file accepted only by `--quick-match` — matched on name, size, and modification time without hashing its contents — SHALL NOT be a source-deletion candidate: trading verification for speed forfeits the right to delete the source. Files whose transfer failed MUST remain on the source. `--delete-source` SHALL force deletion on for the run even when the profile sets `delete_source: false`; forcing it on SHALL NOT bypass the confirmation requirement. `--no-delete-source` SHALL force deletion off for the run; `--keep-source` SHALL be accepted as an undocumented alias of `--no-delete-source`.

@@ -10,3 +10,9 @@ Lightweight MADR format: **Context / Decision / Consequences**. An ADR is writte
 | [0004](0004-yaml-config-with-profile-per-device.md) | YAML config with a profile per device | accepted |
 | [0005](0005-single-crate-trait-based-extensibility.md) | Single crate, trait-based extensibility | accepted |
 | [0006](0006-tesla-wall-clock-naming-vs-system-timezone-instants.md) | Tesla: vehicle-local wall-clock naming vs. system-timezone instants | accepted |
+| [0007](0007-quarantine-copy-is-optional.md) | Quarantine copy is optional | accepted |
+| [0008](0008-global-timezone-and-unified-sidecar.md) | Global timezone configuration and unified import.json sidecar | accepted |
+| [0009](0009-quick-match-trades-verification-for-speed.md) | `--quick-match` trades content verification for speed | accepted |
+| [0010](0010-cleanup-age-is-quarantine-arrival-time.md) | Cleanup age is quarantine arrival time, not recording time | accepted |
+| [0011](0011-cli-overridability-policy.md) | Which profile settings are CLI-overridable, and why | accepted |
+| [0012](0012-copy-verification-reads-back-the-written-file.md) | Copy verification reads back the written file | accepted |

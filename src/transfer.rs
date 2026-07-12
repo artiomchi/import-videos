@@ -330,12 +330,23 @@ fn write_sidecar_inner(dir: &Path, sidecar: &Sidecar) -> Result<()> {
     fs::write(&path, bytes).map_err(|e| Error::io(&path, e))
 }
 
-/// Streams `src` to `<final>.part` under `dest_dir` while hashing the
-/// source, re-hashes the written file, and only on a match renames it
-/// to its final name (design D5). Any failure along the way — copy
-/// error or hash mismatch — removes the `.part` file and leaves `src`
+/// Streams `src` to `<final>.part` under `dest_dir`, hashing it once
+/// while writing, then re-reads and re-hashes the written file and
+/// only on a match renames it to its final name (design D5, and
+/// single-pass-verified-transfer D1-D3: this re-hash of the *written*
+/// file, not a second read of the source, is what makes verification
+/// real). Any failure along the way — copy error, read-back error, or
+/// hash mismatch — removes the `.part` file and leaves `src`
 /// untouched, reported as `TransferOutcome::Failed` rather than
 /// propagated, so the caller can keep processing the rest of the plan.
+/// When the final destination name is already occupied, the source is
+/// hashed once up front to resolve the collision (identical content
+/// skips the copy entirely) before the same single-pass copy and
+/// read-back runs at the suffixed name — so the source is read twice
+/// only on this rare path. The existence check that decides which
+/// branch to take and the eventual rename are not atomic (TOCTOU): this
+/// tool's model assumes the destination library isn't concurrently
+/// mutated by another process.
 /// `recorded_at`, when given, stamps the destination's mtime after the
 /// verified rename (gopro-telemetry design D8) — never for a file
 /// that's skipped as already-imported.
@@ -392,13 +403,27 @@ fn transfer_inner(
         }
     }
 
-    let src_hash = hash_file(src)?;
-
-    let final_path = match resolve_destination(dest_dir, file_name, &src_hash)? {
-        None => return Ok(TransferOutcome::SkippedIdentical),
-        Some(path) => path,
+    // Branch on destination-name occupancy (design D1) rather than
+    // hashing the source up front: in the common unoccupied case, the
+    // final path is the plain name by construction — no pre-hash, no
+    // `resolve_destination` call, so the source is read exactly once
+    // below by `copy_and_hash`. Only when the name is already taken do
+    // we pay for a separate source hash, because knowing it before
+    // copying is what lets identical-content collisions skip the copy
+    // entirely.
+    let dest_candidate = dest_dir.join(file_name);
+    let (final_path, suffixed) = if dest_candidate.exists() {
+        let src_hash = hash_file(src)?;
+        match resolve_destination(dest_dir, file_name, &src_hash)? {
+            None => return Ok(TransferOutcome::SkippedIdentical),
+            Some(path) => {
+                let suffixed = path != dest_candidate;
+                (path, suffixed)
+            }
+        }
+    } else {
+        (dest_candidate, false)
     };
-    let suffixed = final_path != dest_dir.join(file_name);
 
     let part_path = {
         let mut name = final_path.clone().into_os_string();
@@ -406,7 +431,7 @@ fn transfer_inner(
         PathBuf::from(name)
     };
 
-    let dest_hash = match copy_and_hash(src, &part_path, progress) {
+    let stream_hash = match copy_and_hash(src, &part_path, progress) {
         Ok(hash) => hash,
         Err(e) => {
             let _ = fs::remove_file(&part_path);
@@ -414,12 +439,9 @@ fn transfer_inner(
         }
     };
 
-    if dest_hash != src_hash {
+    if let Err(e) = verify_part(&part_path, src, &final_path, &stream_hash) {
         let _ = fs::remove_file(&part_path);
-        return Err(Error::VerifyMismatch {
-            src: src.to_path_buf(),
-            dest: final_path,
-        });
+        return Err(e);
     }
 
     fs::rename(&part_path, &final_path).map_err(|e| Error::io(&final_path, e))?;
@@ -523,6 +545,28 @@ fn copy_and_hash(src: &Path, dest: &Path, progress: &Progress) -> Result<blake3:
     }
     writer.flush().map_err(|e| Error::io(dest, e))?;
     Ok(hasher.finalize())
+}
+
+/// Re-reads and hashes the written `.part` file, comparing it against
+/// the hash captured while streaming the copy (design D2, D3). This is
+/// the seam that makes verification real: it is the only place that
+/// reads back what was actually persisted, rather than re-reading the
+/// source. `src` and `final_path` are only used to shape the
+/// `VerifyMismatch` error message.
+fn verify_part(
+    part_path: &Path,
+    src: &Path,
+    final_path: &Path,
+    expected: &blake3::Hash,
+) -> Result<()> {
+    let actual = hash_file(part_path)?;
+    if actual != *expected {
+        return Err(Error::VerifyMismatch {
+            src: src.to_path_buf(),
+            dest: final_path.to_path_buf(),
+        });
+    }
+    Ok(())
 }
 
 fn hash_file(path: &Path) -> Result<blake3::Hash> {
@@ -643,6 +687,65 @@ mod tests {
         assert_eq!(fs::read(dest_dir.join("clip.mp4")).unwrap(), b"hello");
         assert!(src.exists(), "transfer never deletes the source");
         assert!(!dest_dir.join("clip.mp4.part").exists());
+    }
+
+    // spec scenario "Successful verified copy" / "Source is read once
+    // when no collision exists" (single-pass-verified-transfer): the
+    // unoccupied-name path lands the file at its final name with no
+    // `.part` remnant, the mtime stamped, and the group eligible for
+    // source deletion — the full end state the read-back verification
+    // is supposed to unlock. The "read exactly once" half of the
+    // scenario is enforced structurally rather than measured here: the
+    // unoccupied branch in `transfer_inner` contains no `hash_file(src)`
+    // call at all (design D3), so there is no source-read count to
+    // assert against.
+    #[test]
+    fn happy_path_verified_copy_lands_at_final_name_and_group_is_deletable() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("clip.mp4");
+        fs::write(&src, b"hello world").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let recorded_at: Timestamp = "2026-07-09T07:41:03Z".parse().unwrap();
+        let group = MediaGroup {
+            name: "session".to_string(),
+            files: vec![MediaFile {
+                path: src.clone(),
+                size: 11,
+                recorded_at: Some(recorded_at),
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        let plan = ImportPlan {
+            actions: vec![PlannedAction {
+                group,
+                verdict: Verdict::Keep,
+                destination: Some(dest_dir.clone()),
+                quarantine_path: None,
+            }],
+        };
+
+        let report = execute_inner(&plan, true, true, false, false, &Progress::hidden()).unwrap();
+
+        let dest_path = dest_dir.join("clip.mp4");
+        assert_eq!(fs::read(&dest_path).unwrap(), b"hello world");
+        assert!(!dest_dir.join("clip.mp4.part").exists());
+        let mtime = fs::metadata(&dest_path).unwrap().modified().unwrap();
+        assert_eq!(Timestamp::try_from(mtime).unwrap(), recorded_at);
+
+        assert!(matches!(
+            report.groups[0].files[0].outcome,
+            TransferOutcome::Transferred
+        ));
+        assert!(
+            report.groups[0].deleted_from_source,
+            "verified transfer must make the group eligible for source deletion"
+        );
+        assert!(!src.exists(), "source should be deleted once verified");
     }
 
     #[test]
@@ -858,6 +961,51 @@ mod tests {
             src.exists(),
             "source must be retained when the sidecar fails to write"
         );
+    }
+
+    // --- verify_part seam (design D3, task 1.2) ---
+    //
+    // The corruption path can't be provoked end-to-end through the
+    // public `transfer_file` API (no hook exists between "copy
+    // finished" and "verify ran"), so these tests drive the extracted
+    // seam directly: write a `.part` by hand, then check it against an
+    // expected hash the way `transfer_inner` does.
+
+    #[test]
+    fn verify_part_passes_on_matching_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let part_path = dir.path().join("clip.mp4.part");
+        fs::write(&part_path, b"hello").unwrap();
+        let expected = blake3::hash(b"hello");
+
+        assert!(verify_part(&part_path, Path::new("src"), Path::new("dest"), &expected).is_ok());
+    }
+
+    #[test]
+    fn verify_part_reports_mismatch_on_corrupted_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let part_path = dir.path().join("clip.mp4.part");
+        fs::write(&part_path, b"corrupted").unwrap();
+        let expected = blake3::hash(b"hello");
+
+        let src = Path::new("/source/clip.mp4");
+        let dest = Path::new("/dest/clip.mp4");
+        let err = verify_part(&part_path, src, dest, &expected).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::VerifyMismatch { src: s, dest: d } if s == src && d == dest
+        ));
+    }
+
+    #[test]
+    fn verify_part_reports_io_error_on_unreadable_part() {
+        let dir = tempfile::tempdir().unwrap();
+        let part_path = dir.path().join("missing.mp4.part");
+        let expected = blake3::hash(b"hello");
+
+        let err =
+            verify_part(&part_path, Path::new("src"), Path::new("dest"), &expected).unwrap_err();
+        assert!(matches!(err, Error::Io { .. }));
     }
 
     #[test]
