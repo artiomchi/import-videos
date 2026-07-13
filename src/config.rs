@@ -40,6 +40,11 @@ pub enum SourceKind {
     Gopro {
         #[serde(default = "default_require_marker")]
         require_marker: bool,
+        /// Whether to run GPS telemetry lookup at all for this profile's
+        /// `import` runs (`scan` never runs it regardless — design D2).
+        /// Defaults to `true`, preserving today's behavior.
+        #[serde(default = "default_gps_lookup")]
+        gps_lookup: bool,
     },
     Tesla {
         #[serde(default = "tesla::default_events")]
@@ -53,6 +58,10 @@ fn default_require_marker() -> bool {
     true
 }
 
+fn default_gps_lookup() -> bool {
+    true
+}
+
 impl SourceKind {
     /// Maps a profile's `type` to its `ImportSource` implementation.
     /// This exhaustive match *is* the registry (spec: "Device
@@ -63,8 +72,12 @@ impl SourceKind {
     pub fn build(&self) -> Box<dyn ImportSource> {
         match self {
             SourceKind::Generic => Box::new(GenericSource),
-            SourceKind::Gopro { require_marker } => Box::new(GoproSource {
+            SourceKind::Gopro {
+                require_marker,
+                gps_lookup,
+            } => Box::new(GoproSource {
                 require_marker: *require_marker,
+                gps_lookup: *gps_lookup,
             }),
             SourceKind::Tesla { events, reasons } => Box::new(TeslaSource {
                 events: events.clone(),
@@ -219,6 +232,10 @@ pub fn load(path: &Path) -> Result<Config> {
             .as_mapping()
             .map(|m| m.get("require_marker").is_some())
             .unwrap_or(false);
+        let has_gps_lookup = raw_value
+            .as_mapping()
+            .map(|m| m.get("gps_lookup").is_some())
+            .unwrap_or(false);
         let has_tesla_field = raw_value
             .as_mapping()
             .map(|m| m.get("events").is_some() || m.get("reasons").is_some())
@@ -230,6 +247,11 @@ pub fn load(path: &Path) -> Result<Config> {
         if has_require_marker && !matches!(raw_profile.kind, SourceKind::Gopro { .. }) {
             return Err(Error::Config(format!(
                 "profile '{name}': require_marker is only valid for profiles of type gopro"
+            )));
+        }
+        if has_gps_lookup && !matches!(raw_profile.kind, SourceKind::Gopro { .. }) {
+            return Err(Error::Config(format!(
+                "profile '{name}': gps_lookup is only valid for profiles of type gopro"
             )));
         }
         if has_tesla_field && !matches!(raw_profile.kind, SourceKind::Tesla { .. }) {
@@ -475,6 +497,7 @@ profiles:
         let original = RawProfile {
             kind: SourceKind::Gopro {
                 require_marker: false,
+                gps_lookup: false,
             },
             source: "auto".to_string(),
             destination: "/tmp/dest".to_string(),
@@ -512,6 +535,29 @@ profiles:
     }
 
     #[test]
+    fn gps_lookup_rejected_on_non_gopro_profile() {
+        // Mirrors require_marker_rejected_on_non_gopro_profile: gps_lookup
+        // is validated at YAML-load time the same way require_marker is,
+        // not just at the CLI-override layer.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  cam:\n    type: generic\n    gps_lookup: false\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let err = load(&path).unwrap_err();
+        assert!(matches!(err, Error::Config(_)));
+        assert!(err.to_string().contains("cam"));
+        assert!(err.to_string().contains("gps_lookup"));
+        assert_eq!(err.exit_code(), crate::error::ExitCode::UsageOrConfig);
+    }
+
+    #[test]
     fn gopro_profile_defaults_require_marker_to_true() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.yaml");
@@ -528,7 +574,56 @@ profiles:
         assert_eq!(
             cfg.profiles.get("gopro").unwrap().kind,
             SourceKind::Gopro {
-                require_marker: true
+                require_marker: true,
+                gps_lookup: true,
+            }
+        );
+    }
+
+    #[test]
+    fn gopro_profile_defaults_gps_lookup_to_true() {
+        // Task 1.4: gps_lookup defaults to true when omitted, following
+        // require_marker's exact shape (design D3).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  gopro:\n    type: gopro\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = load(&path).unwrap();
+        assert_eq!(
+            cfg.profiles.get("gopro").unwrap().kind,
+            SourceKind::Gopro {
+                require_marker: true,
+                gps_lookup: true,
+            }
+        );
+    }
+
+    #[test]
+    fn gopro_profile_loads_gps_lookup_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "profiles:\n  gopro:\n    type: gopro\n    source: auto\n    destination: {}\n    layout: \"{{date}}\"\n    gps_lookup: false\n",
+                dir.path().join("dest").display()
+            ),
+        )
+        .unwrap();
+
+        let cfg = load(&path).unwrap();
+        assert_eq!(
+            cfg.profiles.get("gopro").unwrap().kind,
+            SourceKind::Gopro {
+                require_marker: true,
+                gps_lookup: false,
             }
         );
     }

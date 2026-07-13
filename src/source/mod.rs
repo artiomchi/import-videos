@@ -20,15 +20,18 @@ use crate::progress::Progress;
 /// Context passed to every `ImportSource::scan` call: the profile's
 /// ignore-glob set, the configured display/interpretation timezone, the
 /// run-start timestamp (captured once per run so tests can pin it for
-/// deterministic sidecar output — design D5), and a progress reporter
+/// deterministic sidecar output — design D5), a progress reporter
 /// any implementation may use to report scan-phase progress
-/// (add-scan-progress design D1). Implementations that don't need it
-/// (`TeslaSource`) simply never read the field.
+/// (add-scan-progress design D1), and whether GPS telemetry lookup
+/// should run at all (improve-scan-and-cleanup design D2). Implementations
+/// that don't need a field (`TeslaSource` never reads `imported_at` or
+/// `gps_lookup`) simply never read it.
 pub struct ScanContext<'a> {
     pub ignore: &'a GlobSet,
     pub tz: &'a TimeZone,
     pub imported_at: Timestamp,
     pub progress: &'a Progress,
+    pub gps_lookup: bool,
 }
 
 /// A single file belonging to a `MediaGroup` (a clip, a sidecar, ...).

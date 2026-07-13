@@ -193,6 +193,88 @@ fn scan_is_read_only() {
     assert_eq!(tree_snapshot(&card), card_before);
 }
 
+// --- improve-scan-and-cleanup design D5/D6, task 7.5: deleted event never resurfaces ---
+
+#[test]
+fn deleted_saved_clips_event_does_not_resurface_on_a_later_scan_or_import() {
+    // After import + delete removes a SavedClips event's directory
+    // entirely (directory pruning, design D6), a later scan/import must
+    // never report a phantom 0-file group for it — whether because
+    // pruning removed the directory outright, or (were it to somehow
+    // survive) because the zero-file-group filter (design D5) catches
+    // it as a device-agnostic backstop.
+    let dir = tempfile::tempdir().unwrap();
+    let card = dir.path().join("card");
+    let event_dir = card.join("TeslaCam/SavedClips/2026-07-04_18-23-51");
+    write(
+        &event_dir.join("event.json"),
+        &event_json("2026-07-04T18:23:51", "user_interaction_honk"),
+    );
+    write(&event_dir.join("2026-07-04_18-18-32-front.mp4"), "front");
+
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    tesla_config(&config_path, &dest, "    delete_source: true\n");
+
+    let status = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "import",
+            "tesla",
+            "--source",
+            card.to_str().unwrap(),
+            "--yes",
+        ])
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0));
+    assert!(
+        !event_dir.exists(),
+        "the emptied event folder must be pruned after verified deletion"
+    );
+
+    let scan_output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "scan",
+            "tesla",
+            "--source",
+            card.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(scan_output.status.code(), Some(0));
+    let scan_stdout = String::from_utf8_lossy(&scan_output.stdout);
+    assert!(
+        !scan_stdout.contains("2026-07-04_18-23-51"),
+        "a deleted event must never resurface as a phantom group on scan: {scan_stdout}"
+    );
+
+    let import_output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "import",
+            "tesla",
+            "--source",
+            card.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(import_output.status.code(), Some(0));
+    let import_stdout = String::from_utf8_lossy(&import_output.stdout);
+    assert!(
+        !import_stdout.contains("2026-07-04_18-23-51"),
+        "a deleted event must never resurface as a phantom group on import: {import_stdout}"
+    );
+}
+
 // --- 7.4: category and reason filtering yield visible Ignore, never quarantine ---
 
 #[test]

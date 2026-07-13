@@ -484,6 +484,122 @@ fn unmarked_session_without_telemetry_is_still_quarantined() {
     );
 }
 
+// --- improve-scan-and-cleanup design D4, task 7.4: quarantine-bound sessions never pay telemetry cost ---
+
+#[test]
+fn quarantine_bound_session_with_usable_gps_fix_is_never_gps_corrected() {
+    // A session with no HiLight markers under require_marker: true
+    // (the profile default) is Quarantine-bound; even though its
+    // chapter carries a usable GPS fix, that fix must never be applied
+    // — the session's destination lands under the plain quarantine
+    // path, not a GPS-corrected date, and it gets no sidecar (design
+    // D4: verdict decided, and telemetry skipped, before the fix would
+    // ever be read).
+    let dir = tempfile::tempdir().unwrap();
+    let card = dir.path().join("card");
+
+    // Camera clock reads 2026-07-10T00:20; the fixture's GPS fix
+    // would move the session to 2026-07-09 if it were ever applied.
+    let payload = gps_payload(
+        "2026-07-09T23:19:48Z",
+        [515_012_340, -1_234_567, 100_000, 0, 0],
+    );
+    write_chapter(
+        &card.join("DCIM/100GOPRO/GX010400.MP4"),
+        "2026-07-10T00:20:00Z",
+        &[], // no markers -> Quarantine
+        Gpmd::Payloads(vec![payload]),
+    );
+
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    gopro_config(&config_path, &dest, "");
+
+    let status = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "import",
+            "gopro",
+            "--source",
+            card.to_str().unwrap(),
+            "--yes",
+        ])
+        .stdin(Stdio::null())
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(0));
+
+    assert!(
+        dest.join("_quarantine/session-0400/GX010400.MP4").exists(),
+        "unmarked session must land in quarantine, never a GPS-corrected date folder"
+    );
+    assert!(
+        !dest.join("2026/2026-07-09").exists(),
+        "the GPS fix must never be applied to a quarantine-bound session"
+    );
+    assert!(
+        !dest.join("_quarantine/session-0400/import.json").exists(),
+        "quarantined sessions get no sidecar, so there's nothing to show a gps time_source"
+    );
+}
+
+#[test]
+fn scan_never_opens_gpmd_track_even_for_a_keep_bound_session() {
+    // design D1/D2: scan never performs GPS telemetry lookup, full stop
+    // — not just for quarantine-bound sessions. A marked (Keep-bound)
+    // session whose chapter carries a usable GPS fix that would move it
+    // across a day boundary must still show camera-clock time in scan's
+    // inventory, since scan structurally never consults telemetry.
+    let dir = tempfile::tempdir().unwrap();
+    let card = dir.path().join("card");
+
+    // Camera clock reads 2026-07-10T00:20; the fixture's GPS fix would
+    // move the session to 2026-07-09 if telemetry were ever consulted.
+    let payload = gps_payload(
+        "2026-07-09T23:19:48Z",
+        [515_012_340, -1_234_567, 100_000, 0, 0],
+    );
+    write_chapter(
+        &card.join("DCIM/100GOPRO/GX010500.MP4"),
+        "2026-07-10T00:20:00Z",
+        &[500], // marker present -> Keep
+        Gpmd::Payloads(vec![payload]),
+    );
+
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    gopro_config(&config_path, &dest, "");
+
+    let scan_output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "scan",
+            "gopro",
+            "--source",
+            card.to_str().unwrap(),
+            "-v",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(scan_output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&scan_output.stdout);
+    assert!(
+        stdout.contains("[KEEP] session-0500"),
+        "marked session must scan as Keep: {stdout}"
+    );
+    assert!(
+        stdout.contains("2026-07-10 00:20"),
+        "scan must show the camera-clock time, never GPS-corrected, even for a Keep session: {stdout}"
+    );
+    assert!(
+        !stdout.contains("2026-07-09"),
+        "scan must never apply the GPS fix, even though it would otherwise move the session to a different day: {stdout}"
+    );
+}
+
 // --- 7.1: multi-chapter session — each marker carries its chapter file + human offset ---
 
 #[test]

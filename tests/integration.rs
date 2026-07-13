@@ -114,9 +114,13 @@ fn walk(dir: &Path) -> Vec<PathBuf> {
 }
 
 // --- Scan is read-only / dry-run performs no filesystem changes ---
+//
+// improve-scan-and-cleanup design D1: `scan` and `import --dry-run` no
+// longer share `build_plan` — `scan` goes through `build_scan_summary`
+// instead, so the read-only guarantee is exercised separately for each.
 
 #[test]
-fn scan_and_dry_run_perform_no_filesystem_changes() {
+fn dry_run_plan_building_performs_no_filesystem_changes() {
     let dir = tempfile::tempdir().unwrap();
     let src = dir.path().join("source/clip.mp4");
     write_file(&src, b"footage");
@@ -142,6 +146,36 @@ fn scan_and_dry_run_perform_no_filesystem_changes() {
     assert!(
         !dest.exists(),
         "building a plan must not create the destination"
+    );
+}
+
+#[test]
+fn scan_summary_building_performs_no_filesystem_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let src = dir.path().join("source/clip.mp4");
+    write_file(&src, b"footage");
+    let dest = dir.path().join("dest");
+
+    let source_before = tree_snapshot(&dir.path().join("source"));
+
+    let source_impl = TestSource {
+        groups: vec![(group("session", vec![media_file(&src)]), Verdict::Keep)],
+    };
+    let prof = profile(&dest, None, false);
+    let summary = plan::build_scan_summary(
+        &prof,
+        &source_impl,
+        &dir.path().join("source"),
+        &jiff::tz::TimeZone::UTC,
+        &Progress::hidden(),
+    )
+    .unwrap();
+
+    assert_eq!(summary.entries.len(), 1);
+    assert_eq!(tree_snapshot(&dir.path().join("source")), source_before);
+    assert!(
+        !dest.exists(),
+        "building a scan summary must never create the destination"
     );
 }
 
@@ -178,6 +212,7 @@ fn execution_follows_the_plan() {
 
     let report = transfer::execute(
         &import_plan,
+        dir.path(),
         false,
         false,
         false,
@@ -248,6 +283,7 @@ fn transfer_failure_keeps_source_and_does_not_block_other_groups() {
 
     let report = transfer::execute(
         &import_plan,
+        dir.path(),
         false,
         false,
         false,
@@ -323,6 +359,7 @@ fn rerunning_import_is_idempotent() {
 
     let first = transfer::execute(
         &make_plan(),
+        dir.path(),
         false,
         false,
         false,
@@ -339,6 +376,7 @@ fn rerunning_import_is_idempotent() {
 
     let second = transfer::execute(
         &make_plan(),
+        dir.path(),
         false,
         false,
         false,
@@ -382,6 +420,7 @@ fn different_content_at_destination_gets_suffixed() {
 
     let report = transfer::execute(
         &import_plan,
+        dir.path(),
         false,
         false,
         false,
@@ -420,8 +459,16 @@ fn delete_source_removes_file_after_confirmed_transfer() {
     )
     .unwrap();
 
-    let report =
-        transfer::execute(&import_plan, true, true, false, false, &Progress::hidden()).unwrap();
+    let report = transfer::execute(
+        &import_plan,
+        dir.path(),
+        true,
+        true,
+        false,
+        false,
+        &Progress::hidden(),
+    )
+    .unwrap();
 
     assert!(report.groups[0].deleted_from_source);
     assert!(!src.exists());
@@ -577,6 +624,7 @@ fn disabled_quarantine_copy_leaves_source_and_creates_no_dir() {
     .unwrap();
     let report = transfer::execute(
         &import_plan,
+        dir.path(),
         false,
         false,
         false,
@@ -653,8 +701,16 @@ fn disabled_quarantine_copy_source_not_deleted_even_with_delete_source() {
     )
     .unwrap();
     // assume_yes = true to skip the interactive prompt.
-    let report =
-        transfer::execute(&import_plan, true, true, false, false, &Progress::hidden()).unwrap();
+    let report = transfer::execute(
+        &import_plan,
+        dir.path(),
+        true,
+        true,
+        false,
+        false,
+        &Progress::hidden(),
+    )
+    .unwrap();
 
     // The Keep group's source is deleted after a verified transfer.
     assert!(
@@ -794,8 +850,16 @@ fn quick_match_hit_skips_hashing_and_reports_distinct_outcome() {
     )
     .unwrap();
 
-    let report =
-        transfer::execute(&import_plan, false, false, true, false, &Progress::hidden()).unwrap();
+    let report = transfer::execute(
+        &import_plan,
+        dir.path(),
+        false,
+        false,
+        true,
+        false,
+        &Progress::hidden(),
+    )
+    .unwrap();
 
     assert_eq!(
         report.groups[0].files[0].outcome,
@@ -837,8 +901,16 @@ fn quick_match_miss_on_size_difference_falls_through_to_verified_transfer() {
     )
     .unwrap();
 
-    let report =
-        transfer::execute(&import_plan, false, false, true, false, &Progress::hidden()).unwrap();
+    let report = transfer::execute(
+        &import_plan,
+        dir.path(),
+        false,
+        false,
+        true,
+        false,
+        &Progress::hidden(),
+    )
+    .unwrap();
 
     // Size mismatch → miss → falls through to full verified transfer; content
     // differs from destination, so it gets suffixed.
@@ -884,8 +956,16 @@ fn fully_quick_matched_group_is_never_deleted_even_with_delete_source_and_yes() 
     .unwrap();
 
     // delete_source=true, assume_yes=true, quick_match=true
-    let report =
-        transfer::execute(&import_plan, true, true, true, false, &Progress::hidden()).unwrap();
+    let report = transfer::execute(
+        &import_plan,
+        dir.path(),
+        true,
+        true,
+        true,
+        false,
+        &Progress::hidden(),
+    )
+    .unwrap();
 
     // The group must be SkippedQuickMatch (not content-verified).
     assert_eq!(

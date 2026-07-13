@@ -14,7 +14,7 @@ use jiff::Timestamp;
 use jiff::tz::TimeZone;
 use serde::Serialize;
 
-use crate::plan::{ImportPlan, PlannedAction};
+use crate::plan::{ImportPlan, PlannedAction, ScanEntry, ScanSummary};
 use crate::source::{MediaFile, Sidecar, Verdict};
 use crate::transfer::{ExecuteReport, FileResult, GroupResult, TransferOutcome};
 
@@ -59,9 +59,16 @@ struct VerdictTally {
 
 impl VerdictTally {
     fn add(&mut self, files: &[MediaFile]) {
+        self.add_counts(files.len(), files.iter().map(|f| f.size).sum());
+    }
+
+    /// Same tally, from a scan entry's already-computed counts rather
+    /// than a live `&[MediaFile]` slice — `ScanEntry` carries only the
+    /// count and byte total, not the files themselves (design D1).
+    fn add_counts(&mut self, file_count: usize, bytes: u64) {
         self.groups += 1;
-        self.files += files.len();
-        self.bytes += files.iter().map(|f| f.size).sum::<u64>();
+        self.files += file_count;
+        self.bytes += bytes;
     }
 
     fn render(&self, label: &str) -> String {
@@ -87,6 +94,14 @@ impl VerdictTotals {
             Verdict::Keep => self.kept.add(files),
             Verdict::Quarantine => self.quarantined.add(files),
             Verdict::Ignore(_) => self.ignored.add(files),
+        }
+    }
+
+    fn record_counts(&mut self, verdict: &Verdict, file_count: usize, bytes: u64) {
+        match verdict {
+            Verdict::Keep => self.kept.add_counts(file_count, bytes),
+            Verdict::Quarantine => self.quarantined.add_counts(file_count, bytes),
+            Verdict::Ignore(_) => self.ignored.add_counts(file_count, bytes),
         }
     }
 
@@ -230,7 +245,26 @@ fn format_short_ts(ts: Timestamp, tz: &TimeZone) -> String {
 /// "… and N more" line appears only when the cap actually truncates —
 /// at or under the cap, default and verbose output are identical.
 fn render_unrecognized_files(out: &mut String, files: &[MediaFile], verbose: bool) {
-    let mut names: Vec<String> = files.iter().map(|f| file_display_name(&f.path)).collect();
+    let names: Vec<String> = files.iter().map(|f| file_display_name(&f.path)).collect();
+    render_file_name_list(out, names, verbose);
+}
+
+/// Same rendering as `render_unrecognized_files`, from a scan entry's
+/// already-collected file path strings (design D1) rather than a live
+/// `&[MediaFile]` slice.
+fn render_scan_unrecognized_files(out: &mut String, files: &[String], verbose: bool) {
+    let names: Vec<String> = files
+        .iter()
+        .map(|f| file_display_name(Path::new(f)))
+        .collect();
+    render_file_name_list(out, names, verbose);
+}
+
+/// Shared body of `render_unrecognized_files`/`render_scan_unrecognized_files`
+/// (design D6, task 5.1): sorts, caps at `UNRECOGNIZED_DEFAULT_CAP`
+/// unless `verbose`, and appends a "… and N more" line only when the
+/// cap actually truncates.
+fn render_file_name_list(out: &mut String, mut names: Vec<String>, verbose: bool) {
     names.sort();
 
     let _ = write!(out, " ({})", plural(names.len(), "file"));
@@ -288,6 +322,93 @@ fn render_quarantine_rollup(out: &mut String, entries: &[&PlannedAction]) {
         }
     }
     let _ = writeln!(out, "  (-v to list)");
+}
+
+/// Renders `scan`'s source-only inventory (design D1): the same
+/// verdict-tally / unrecognized-files-cap conventions `render_plan`
+/// uses, but with no per-entry destination or quarantine path —
+/// `ScanEntry` is structurally incapable of carrying one.
+pub fn render_scan_summary(summary: &ScanSummary, verbose: bool, tz: &TimeZone) -> String {
+    if summary.entries.is_empty() {
+        return "No media found; nothing to import.\n".to_string();
+    }
+
+    let mut out = String::new();
+    let mut totals = VerdictTotals::default();
+    let mut quarantine_entries: Vec<&ScanEntry> = Vec::new();
+
+    for entry in &summary.entries {
+        totals.record_counts(&entry.verdict, entry.file_count, entry.total_size);
+
+        if matches!(entry.verdict, Verdict::Quarantine) {
+            quarantine_entries.push(entry);
+            if !verbose {
+                continue;
+            }
+        }
+
+        render_scan_entry(&mut out, entry, verbose, tz);
+    }
+
+    if !verbose && !quarantine_entries.is_empty() {
+        render_scan_quarantine_rollup(&mut out, &quarantine_entries);
+    }
+
+    let _ = writeln!(out, "Summary: {}", totals.render());
+
+    out
+}
+
+/// Renders one scan entry: `[VERDICT] name`, then either the
+/// unrecognized-files listing or (for `Keep`/`Quarantine`) the
+/// recorded time, file count, and total size — no path, ever
+/// (design D1). `Ignore`'s reason clause is the only fixed-string
+/// exception, matching `render_plan_entry`.
+fn render_scan_entry(out: &mut String, entry: &ScanEntry, verbose: bool, tz: &TimeZone) {
+    let label = match &entry.verdict {
+        Verdict::Keep => "KEEP",
+        Verdict::Quarantine => "QUARANTINE",
+        Verdict::Ignore(_) => "IGNORE",
+    };
+
+    let _ = write!(out, "[{label}] {}", entry.name);
+    if let Verdict::Ignore(reason) = &entry.verdict {
+        let _ = write!(out, " — {reason}");
+    }
+
+    let is_unrecognized =
+        matches!(&entry.verdict, Verdict::Ignore(reason) if reason == UNRECOGNIZED_REASON);
+    if is_unrecognized {
+        render_scan_unrecognized_files(out, &entry.files, verbose);
+    } else if !matches!(entry.verdict, Verdict::Ignore(_)) {
+        let short_time = format_short_ts(entry.recorded_at, tz);
+        let _ = write!(
+            out,
+            "  {short_time}  {}, {}",
+            plural(entry.file_count, "file"),
+            format_size(entry.total_size)
+        );
+    }
+    let _ = writeln!(out);
+
+    if verbose && !is_unrecognized {
+        let _ = writeln!(out, "  recorded at: {}", format_ts(entry.recorded_at, tz));
+    }
+}
+
+/// One default-mode line standing in for every `Quarantine` scan entry
+/// (design D1, mirrors `render_quarantine_rollup`): count and aggregate
+/// size only — `scan` never resolves a quarantine path to show, so
+/// there is no path-or-disabled-note branch here.
+fn render_scan_quarantine_rollup(out: &mut String, entries: &[&ScanEntry]) {
+    let count = entries.len();
+    let bytes: u64 = entries.iter().map(|e| e.total_size).sum();
+    let _ = writeln!(
+        out,
+        "Quarantine: {}, {}  (-v to list)",
+        plural(count, "group"),
+        format_size(bytes)
+    );
 }
 
 /// A device's sidecar may note where a group's timestamp came from
@@ -650,6 +771,78 @@ pub fn plan_to_json(plan: &ImportPlan, tz: &TimeZone) -> PlanJson {
     let total = plan.actions.len();
     PlanJson {
         actions,
+        summary: PlanSummaryJson {
+            kept,
+            quarantined,
+            ignored,
+            total,
+        },
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScanEntryJson {
+    pub group: String,
+    pub verdict: String,
+    pub reason: String,
+    pub file_count: usize,
+    pub total_size_bytes: u64,
+    pub recorded_at: String,
+    /// Every file in the group, uncapped, naming the same field the
+    /// human render truncates for the unrecognized-files group (spec:
+    /// "scan's inventory entries SHALL do the same for their file
+    /// listings"). No `path` field anywhere — `scan` never resolves one
+    /// (design D1).
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ScanSummaryJson {
+    pub entries: Vec<ScanEntryJson>,
+    pub summary: PlanSummaryJson,
+}
+
+/// Builds the JSON view of a `ScanSummary` (design D1, D4). Distinct
+/// from `PlanJson`: no entry carries a `path` field, since `scan` never
+/// resolves a destination or quarantine path. Reuses `PlanSummaryJson`
+/// for the closing tally — the shape (kept/quarantined/ignored/total)
+/// is identical, so a separate type would only duplicate it.
+pub fn scan_summary_to_json(summary: &ScanSummary, tz: &TimeZone) -> ScanSummaryJson {
+    let mut kept = 0usize;
+    let mut quarantined = 0usize;
+    let mut ignored = 0usize;
+
+    let entries = summary
+        .entries
+        .iter()
+        .map(|entry| {
+            match &entry.verdict {
+                Verdict::Keep => kept += 1,
+                Verdict::Quarantine => quarantined += 1,
+                Verdict::Ignore(_) => ignored += 1,
+            }
+            let (verdict, reason) = match &entry.verdict {
+                Verdict::Keep => ("keep", "matches profile criteria".to_string()),
+                Verdict::Quarantine => {
+                    ("quarantine", "does not match profile criteria".to_string())
+                }
+                Verdict::Ignore(reason) => ("ignore", reason.clone()),
+            };
+            ScanEntryJson {
+                group: entry.name.clone(),
+                verdict: verdict.to_string(),
+                reason,
+                file_count: entry.file_count,
+                total_size_bytes: entry.total_size,
+                recorded_at: format_ts(entry.recorded_at, tz),
+                files: entry.files.clone(),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let total = summary.entries.len();
+    ScanSummaryJson {
+        entries,
         summary: PlanSummaryJson {
             kept,
             quarantined,
@@ -1832,5 +2025,144 @@ mod tests {
         let value = serde_json::to_value(&json).unwrap();
         assert_eq!(value["deletion_skipped_reason"], "declined");
         assert_eq!(value["summary"]["transferred"], 0);
+    }
+
+    // --- scan summary rendering and JSON (design D1, task 5.4) ---
+
+    fn scan_entry(name: &str, verdict: Verdict, file_count: usize, total_size: u64) -> ScanEntry {
+        ScanEntry {
+            name: name.to_string(),
+            verdict,
+            file_count,
+            total_size,
+            recorded_at: "2026-07-09T07:41:03Z".parse().unwrap(),
+            files: vec![],
+        }
+    }
+
+    #[test]
+    fn scan_summary_shows_time_file_count_and_size_no_destination_path() {
+        let summary = ScanSummary {
+            entries: vec![scan_entry("session-0123", Verdict::Keep, 2, 2048)],
+        };
+
+        let out = render_scan_summary(&summary, false, &jiff::tz::TimeZone::UTC);
+
+        assert!(
+            out.contains("[KEEP] session-0123  2026-07-09 07:41  2 files, 2.0 KiB"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("->"),
+            "scan must never show a destination path: {out}"
+        );
+    }
+
+    #[test]
+    fn scan_quarantine_rollup_shows_count_and_size_no_quarantine_path() {
+        let summary = ScanSummary {
+            entries: vec![
+                scan_entry("session-a", Verdict::Quarantine, 1, 1024),
+                scan_entry("session-b", Verdict::Quarantine, 1, 1024),
+            ],
+        };
+
+        let out = render_scan_summary(&summary, false, &jiff::tz::TimeZone::UTC);
+
+        assert!(
+            !out.contains("[QUARANTINE]"),
+            "individual entries stay collapsed by default: {out}"
+        );
+        assert!(
+            out.contains("Quarantine: 2 groups, 2.0 KiB  (-v to list)"),
+            "got: {out}"
+        );
+        assert!(
+            !out.contains("->"),
+            "scan must never show a quarantine path: {out}"
+        );
+    }
+
+    #[test]
+    fn scan_unrecognized_files_capped_at_five_by_default() {
+        let files: Vec<String> = (0..8).map(|i| format!("/card/stray{i:02}.dat")).collect();
+        let summary = ScanSummary {
+            entries: vec![ScanEntry {
+                name: "unrecognized".to_string(),
+                verdict: Verdict::Ignore("unrecognized file(s)".to_string()),
+                file_count: 8,
+                total_size: 80,
+                recorded_at: ts(0),
+                files,
+            }],
+        };
+
+        let default_out = render_scan_summary(&summary, false, &jiff::tz::TimeZone::UTC);
+        assert!(default_out.contains("[IGNORE] unrecognized — unrecognized file(s) (8 files)"));
+        for i in 0..5 {
+            assert!(
+                default_out.contains(&format!("stray{i:02}.dat")),
+                "{default_out}"
+            );
+        }
+        for i in 5..8 {
+            assert!(
+                !default_out.contains(&format!("stray{i:02}.dat")),
+                "{default_out}"
+            );
+        }
+        assert!(default_out.contains("… and 3 more (-v to list all)"));
+
+        let verbose_out = render_scan_summary(&summary, true, &jiff::tz::TimeZone::UTC);
+        for i in 0..8 {
+            assert!(
+                verbose_out.contains(&format!("stray{i:02}.dat")),
+                "{verbose_out}"
+            );
+        }
+        assert!(!verbose_out.contains("more (-v to list all)"));
+    }
+
+    #[test]
+    fn scan_summary_json_has_no_path_field_anywhere() {
+        let summary = ScanSummary {
+            entries: vec![
+                scan_entry("session-a", Verdict::Keep, 1, 1024),
+                scan_entry("session-b", Verdict::Quarantine, 1, 1024),
+            ],
+        };
+
+        let json = scan_summary_to_json(&summary, &jiff::tz::TimeZone::UTC);
+        let value = serde_json::to_value(&json).unwrap();
+        let dumped = serde_json::to_string(&value).unwrap();
+        assert!(
+            !dumped.contains("\"path\""),
+            "scan JSON must never carry a path field: {dumped}"
+        );
+        assert_eq!(json.summary.kept, 1);
+        assert_eq!(json.summary.quarantined, 1);
+        assert_eq!(json.summary.total, 2);
+    }
+
+    #[test]
+    fn scan_summary_json_files_array_is_never_truncated() {
+        let files: Vec<String> = (0..8).map(|i| format!("/card/stray{i:02}.dat")).collect();
+        let summary = ScanSummary {
+            entries: vec![ScanEntry {
+                name: "unrecognized".to_string(),
+                verdict: Verdict::Ignore("unrecognized file(s)".to_string()),
+                file_count: 8,
+                total_size: 80,
+                recorded_at: ts(0),
+                files,
+            }],
+        };
+
+        let json = scan_summary_to_json(&summary, &jiff::tz::TimeZone::UTC);
+        assert_eq!(
+            json.entries[0].files.len(),
+            8,
+            "JSON must name every file even though the human render caps at 5"
+        );
     }
 }

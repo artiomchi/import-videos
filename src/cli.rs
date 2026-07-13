@@ -91,6 +91,33 @@ pub enum Command {
         #[arg(long, overrides_with = "reflink")]
         no_reflink: bool,
 
+        /// Override the profile's quarantine directory for this run;
+        /// implies `--copy-quarantine` (design D4). Combining this with
+        /// `--no-copy-quarantine` is a usage error. `import`-only: `scan`
+        /// never resolves or shows a quarantine path (design D1/D7).
+        #[arg(long, conflicts_with = "no_copy_quarantine")]
+        quarantine: Option<PathBuf>,
+
+        /// Force quarantine copying on for this run, even if the profile
+        /// sets `copy_quarantine: false`
+        #[arg(long, overrides_with = "no_copy_quarantine")]
+        copy_quarantine: bool,
+
+        /// Force quarantine copying off for this run, even if the
+        /// profile sets `copy_quarantine: true`
+        #[arg(long, overrides_with = "copy_quarantine")]
+        no_copy_quarantine: bool,
+
+        /// Force GoPro GPS telemetry lookup on for this run, even if the
+        /// profile sets `gps_lookup: false` (GoPro profiles only)
+        #[arg(long, overrides_with = "no_gopro_gps_lookup")]
+        gopro_gps_lookup: bool,
+
+        /// Force GoPro GPS telemetry lookup off for this run, even if
+        /// the profile sets `gps_lookup: true` (GoPro profiles only)
+        #[arg(long, overrides_with = "gopro_gps_lookup")]
+        no_gopro_gps_lookup: bool,
+
         #[command(flatten)]
         overrides: OverrideFlags,
     },
@@ -123,27 +150,15 @@ pub enum Command {
 }
 
 /// Plan-shaping override flags shared by `scan` and `import` (design
-/// D6) — everything that changes what the plan shows. `--delete-source`
-/// only affects execution, so it lives on `Import` alone, outside this
-/// struct.
+/// D6): the one remaining pair whose effect `scan`'s inventory can
+/// still show, since it changes verdict counts. Every other override
+/// (`--quarantine`, `--copy-quarantine`/`--no-copy-quarantine`,
+/// `--reflink`/`--no-reflink`, `--delete-source`/`--no-delete-source`,
+/// `--gopro-gps-lookup`/`--no-gopro-gps-lookup`) lives on `Import`
+/// alone, since `scan` never resolves or shows a destination/quarantine
+/// path and never performs GPS lookup (design D1, D7).
 #[derive(clap::Args, Debug, Default)]
 pub struct OverrideFlags {
-    /// Override the profile's quarantine directory for this run;
-    /// implies `--copy-quarantine` (design D4). Combining this with
-    /// `--no-copy-quarantine` is a usage error.
-    #[arg(long, conflicts_with = "no_copy_quarantine")]
-    pub quarantine: Option<PathBuf>,
-
-    /// Force quarantine copying on for this run, even if the profile
-    /// sets `copy_quarantine: false`
-    #[arg(long, overrides_with = "no_copy_quarantine")]
-    pub copy_quarantine: bool,
-
-    /// Force quarantine copying off for this run, even if the profile
-    /// sets `copy_quarantine: true`
-    #[arg(long, overrides_with = "copy_quarantine")]
-    pub no_copy_quarantine: bool,
-
     /// Force the GoPro marker requirement on for this run
     /// (GoPro profiles only)
     #[arg(long, overrides_with = "no_gopro_require_marker")]
@@ -156,23 +171,16 @@ pub struct OverrideFlags {
 }
 
 impl OverrideFlags {
-    /// Collapses the parsed flag pairs into a plain `Overrides`
-    /// (design D5) — neutral data only. `--quarantine`'s implication
-    /// of `copy_quarantine: true` and GoPro-only validation of the
-    /// marker flags are business rules applied where the override is
-    /// consumed (`lib.rs`), not here. `delete_source` and `reflink` are
-    /// always `None` here since neither is part of this shared flag
-    /// set; `Import` fills them in separately.
+    /// Collapses the parsed flag pair into a plain `Overrides` (design
+    /// D5) — neutral data only. Every other field is filled in
+    /// separately by `Import`'s own flags in `run_inner`.
     pub fn to_overrides(&self) -> Overrides {
         Overrides {
-            delete_source: None,
-            copy_quarantine: override_pair(self.copy_quarantine, self.no_copy_quarantine),
             gopro_require_marker: override_pair(
                 self.gopro_require_marker,
                 self.no_gopro_require_marker,
             ),
-            quarantine: self.quarantine.clone(),
-            reflink: None,
+            ..Default::default()
         }
     }
 }
@@ -187,6 +195,7 @@ pub struct Overrides {
     pub gopro_require_marker: Option<bool>,
     pub quarantine: Option<PathBuf>,
     pub reflink: Option<bool>,
+    pub gps_lookup: Option<bool>,
 }
 
 /// Collapses a paired override flag (`--foo`/`--no-foo`) to
@@ -277,28 +286,57 @@ mod tests {
 
     #[test]
     fn last_flag_of_a_pair_wins() {
+        // gopro_require_marker is the one pair still shared by scan and
+        // import (design D7) — it's the flag exercised here.
         let overrides = scan_overrides(parse(&[
             "scan",
             "cam",
-            "--no-copy-quarantine",
-            "--copy-quarantine",
+            "--no-gopro-require-marker",
+            "--gopro-require-marker",
         ]));
-        assert_eq!(overrides.to_overrides().copy_quarantine, Some(true));
+        assert_eq!(overrides.to_overrides().gopro_require_marker, Some(true));
 
         let overrides = scan_overrides(parse(&[
             "scan",
             "cam",
-            "--copy-quarantine",
-            "--no-copy-quarantine",
+            "--gopro-require-marker",
+            "--no-gopro-require-marker",
         ]));
-        assert_eq!(overrides.to_overrides().copy_quarantine, Some(false));
+        assert_eq!(overrides.to_overrides().gopro_require_marker, Some(false));
+    }
+
+    #[test]
+    fn import_only_last_flag_of_a_pair_wins() {
+        // copy_quarantine and gps_lookup moved to Import-only (design
+        // D7); last-one-wins still holds there.
+        let cli = parse(&[
+            "import",
+            "cam",
+            "--no-copy-quarantine",
+            "--copy-quarantine",
+            "--no-gopro-gps-lookup",
+            "--gopro-gps-lookup",
+        ]);
+        match cli.command {
+            Command::Import {
+                copy_quarantine,
+                no_copy_quarantine,
+                gopro_gps_lookup,
+                no_gopro_gps_lookup,
+                ..
+            } => {
+                assert!(copy_quarantine && !no_copy_quarantine);
+                assert!(gopro_gps_lookup && !no_gopro_gps_lookup);
+            }
+            _ => panic!("expected Import"),
+        }
     }
 
     #[test]
     fn quarantine_conflicts_with_no_copy_quarantine() {
         let result = Cli::try_parse_from([
             "import-videos",
-            "scan",
+            "import",
             "cam",
             "--quarantine",
             "/tmp/q",
@@ -316,5 +354,50 @@ mod tests {
             } => assert!(no_delete_source),
             _ => panic!("expected Import"),
         }
+    }
+
+    // --- scan-only usage errors (design D1/D7, task 3.5) ---
+    //
+    // scan never resolves or shows a destination/quarantine path and
+    // never performs GPS lookup, so these Import-only flags are usage
+    // errors on scan, exactly like `scan --reflink` already is.
+
+    #[test]
+    fn scan_quarantine_flag_fails_to_parse() {
+        let result =
+            Cli::try_parse_from(["import-videos", "scan", "cam", "--quarantine", "/tmp/q"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scan_copy_quarantine_flag_fails_to_parse() {
+        let result = Cli::try_parse_from(["import-videos", "scan", "cam", "--copy-quarantine"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scan_no_copy_quarantine_flag_fails_to_parse() {
+        let result = Cli::try_parse_from(["import-videos", "scan", "cam", "--no-copy-quarantine"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scan_gopro_gps_lookup_flag_fails_to_parse() {
+        let result = Cli::try_parse_from(["import-videos", "scan", "cam", "--gopro-gps-lookup"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scan_no_gopro_gps_lookup_flag_fails_to_parse() {
+        let result = Cli::try_parse_from(["import-videos", "scan", "cam", "--no-gopro-gps-lookup"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn scan_reflink_flag_still_fails_to_parse() {
+        // Pre-existing behavior (add-reflink-transfer); kept here as a
+        // baseline alongside the new scan-only-usage-error tests above.
+        let result = Cli::try_parse_from(["import-videos", "scan", "cam", "--reflink"]);
+        assert!(result.is_err());
     }
 }

@@ -27,6 +27,10 @@ const CAMERA_MODEL: &str = "gopro-hero8";
 
 pub struct GoproSource {
     pub require_marker: bool,
+    /// Whether GPS telemetry lookup should run at all for this profile's
+    /// `import` runs (improve-scan-and-cleanup design D2, D3). `scan`
+    /// always passes `ctx.gps_lookup: false` regardless of this field.
+    pub gps_lookup: bool,
 }
 
 impl ImportSource for GoproSource {
@@ -100,7 +104,13 @@ impl ImportSource for GoproSource {
 impl GoproSource {
     /// Builds one session's `MediaGroup` and verdict from its
     /// chapter-ordered file list (design D3, D5-D8), correcting for
-    /// GPS telemetry when it's available (design D3-D7).
+    /// GPS telemetry when it's available (design D3-D7). HiLight marker
+    /// *offsets* are read first (no telemetry) so the verdict is decided
+    /// before telemetry runs; telemetry is then attempted only for a
+    /// `Keep`-bound session with `ctx.gps_lookup: true` — a session that
+    /// will end up `Quarantine`d never pays that cost, since its
+    /// destination doesn't use the timestamp (improve-scan-and-cleanup
+    /// design D2, D4).
     fn build_session(
         &self,
         session_id: &str,
@@ -112,11 +122,6 @@ impl GoproSource {
             .map(|(_, path)| chapter_civil_time(path))
             .collect();
 
-        let mut telemetry: Vec<Option<ChapterTelemetry>> = chapters
-            .iter()
-            .map(|(_, path)| open_chapter_telemetry(path))
-            .collect();
-
         // Convert camera-clock civil times to instants. For GPS-corrected
         // sessions the GPS path overrides these later; for camera-clock
         // sessions these ARE the instants — interpreted in ctx.tz so the
@@ -126,21 +131,70 @@ impl GoproSource {
             .map(|&dt| civil_to_instant(dt, ctx.tz))
             .collect();
 
-        let (session_offset, visited) = derive_session_offset(
-            session_id,
-            chapters,
-            &chapter_times,
-            &mut telemetry,
-            ctx.progress,
-        );
-        // Chapters the GPS search never reached (a fix was already found,
-        // or the session has no telemetry at all) still count as visited
-        // for progress purposes — one tick per chapter, total (design D3).
-        ctx.progress.inc(chapters.len() as u64 - visited as u64);
+        // Marker offsets only (an HMMT box read, no telemetry) decide the
+        // verdict before telemetry ever runs (design D4).
+        let marker_offsets: Vec<Vec<u32>> = chapters
+            .iter()
+            .map(|(_, path)| chapter_markers(path))
+            .collect();
+        let has_markers = marker_offsets.iter().any(|offsets| !offsets.is_empty());
 
+        let verdict = if !self.require_marker || has_markers {
+            Verdict::Keep
+        } else {
+            Verdict::Quarantine
+        };
+
+        // Telemetry only runs for a Keep-bound session with GPS lookup
+        // enabled; a Quarantine-bound session's destination never uses
+        // the timestamp, and `gps_lookup: false` disables it outright
+        // (design D2, D4). Both skip paths land on the same
+        // "session_offset: None" state the "no chapter yielded a usable
+        // fix" path already produces — no separate degraded-mode logic.
+        let run_telemetry = verdict == Verdict::Keep && ctx.gps_lookup;
+
+        let (session_offset, mut telemetry): (
+            Option<SessionTelemetry>,
+            Vec<Option<ChapterTelemetry>>,
+        ) = if run_telemetry {
+            let mut telemetry: Vec<Option<ChapterTelemetry>> = chapters
+                .iter()
+                .map(|(_, path)| open_chapter_telemetry(path))
+                .collect();
+            let (session_offset, visited) = derive_session_offset(
+                session_id,
+                chapters,
+                &chapter_times,
+                &mut telemetry,
+                ctx.progress,
+            );
+            // Chapters the GPS search never reached (a fix was already
+            // found, or the session has no telemetry at all) still
+            // count as visited for progress purposes — one tick per
+            // chapter, total (design D3).
+            ctx.progress.inc(chapters.len() as u64 - visited as u64);
+            (session_offset, telemetry)
+        } else {
+            // Telemetry skipped outright: no chapter is visited by the
+            // GPS search loop, so tick (and name) each one here instead,
+            // matching derive_session_offset's per-chapter message so the
+            // progress bar keeps showing the current file even when
+            // telemetry never runs (regression fix: a bulk `inc` with no
+            // `set_message` left the bar's filename stale for every
+            // quarantine-bound or gps_lookup: false session).
+            for (_, path) in chapters {
+                ctx.progress
+                    .set_message(format!("session {session_id}: {}", file_name(path)));
+                ctx.progress.inc(1);
+            }
+            (None, chapters.iter().map(|_| None).collect())
+        };
+
+        // Second pass: marker wall-times/coordinates, computed now that
+        // telemetry has run (or been skipped) — design D4.
         let mut all_markers: Vec<MarkerHit> = Vec::new();
         for (i, (_, path)) in chapters.iter().enumerate() {
-            for offset_ms in chapter_markers(path) {
+            for &offset_ms in &marker_offsets[i] {
                 let camera_wall_time =
                     chapter_times[i] + Span::new().milliseconds(offset_ms as i64);
                 let (wall_time, coords) = match &session_offset {
@@ -161,12 +215,6 @@ impl GoproSource {
                 });
             }
         }
-
-        let verdict = if !self.require_marker || !all_markers.is_empty() {
-            Verdict::Keep
-        } else {
-            Verdict::Quarantine
-        };
 
         // Session timestamp: GPS-corrected when telemetry provided an
         // offset (already a real instant); otherwise the first chapter's
@@ -682,11 +730,22 @@ mod tests {
         imported_at: Timestamp,
         progress: &'a Progress,
     ) -> ScanContext<'a> {
+        make_ctx_with_gps_lookup(ignore, tz, imported_at, progress, true)
+    }
+
+    fn make_ctx_with_gps_lookup<'a>(
+        ignore: &'a globset::GlobSet,
+        tz: &'a TimeZone,
+        imported_at: Timestamp,
+        progress: &'a Progress,
+        gps_lookup: bool,
+    ) -> ScanContext<'a> {
         ScanContext {
             ignore,
             tz,
             imported_at,
             progress,
+            gps_lookup,
         }
     }
 
@@ -746,6 +805,7 @@ mod tests {
         // session with no markers is Keep, and still gets a sidecar.
         let source = GoproSource {
             require_marker: false,
+            gps_lookup: true,
         };
         let dir = tempfile::tempdir().unwrap();
         let chapter = dir.path().join("GX010124.MP4");
@@ -776,6 +836,7 @@ mod tests {
 
         let source = GoproSource {
             require_marker: true,
+            gps_lookup: true,
         };
         assert!(source.detect(dir.path()));
     }
@@ -787,6 +848,7 @@ mod tests {
 
         let source = GoproSource {
             require_marker: true,
+            gps_lookup: true,
         };
         assert!(!source.detect(dir.path()));
     }
@@ -798,6 +860,7 @@ mod tests {
 
         let source = GoproSource {
             require_marker: true,
+            gps_lookup: true,
         };
         assert!(!source.detect(dir.path()));
     }
@@ -1061,6 +1124,7 @@ mod tests {
 
         let source = GoproSource {
             require_marker: true,
+            gps_lookup: true,
         };
         let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
         let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
@@ -1110,6 +1174,7 @@ mod tests {
 
         let source = GoproSource {
             require_marker: false,
+            gps_lookup: true,
         };
         let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
         let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
@@ -1140,6 +1205,7 @@ mod tests {
 
         let source = GoproSource {
             require_marker: true,
+            gps_lookup: true,
         };
         let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
         let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
@@ -1171,6 +1237,7 @@ mod tests {
 
         let source = GoproSource {
             require_marker: true,
+            gps_lookup: true,
         };
         let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
         let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
@@ -1235,6 +1302,7 @@ mod tests {
 
         let source = GoproSource {
             require_marker: false,
+            gps_lookup: true,
         };
         let progress = Progress::counted(true, "Scanning");
         let (ignore, tz, imported_at, _hidden) = test_ctx_with_tz(TimeZone::UTC);
@@ -1247,6 +1315,147 @@ mod tests {
             4,
             "one tick per discovered chapter, whether examined during the \
              GPS search or ticked in the post-search catch-up"
+        );
+    }
+
+    #[test]
+    fn scan_progress_counts_quarantine_bound_skipped_telemetry_chapters() {
+        // Task 2.4/2.5 (improve-scan-and-cleanup design D4): a
+        // Quarantine-bound session's chapters are never visited by
+        // derive_session_offset's loop at all now, since telemetry is
+        // skipped outright — build_session's catch-up increment must
+        // still tick once per chapter.
+        let dir = tempfile::tempdir().unwrap();
+        let dcim = dir.path().join("DCIM/100GOPRO");
+        fs::create_dir_all(&dcim).unwrap();
+
+        // No markers, require_marker: true -> Quarantine, telemetry
+        // skipped entirely for both chapters.
+        write_chapter(&dcim.join("GX010001.MP4"), "2026-07-10T00:00:00Z", &[], &[]);
+        write_chapter(&dcim.join("GX020001.MP4"), "2026-07-10T00:01:00Z", &[], &[]);
+
+        let source = GoproSource {
+            require_marker: true,
+            gps_lookup: true,
+        };
+        let progress = Progress::counted(true, "Scanning");
+        let (ignore, tz, imported_at, _hidden) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
+
+        let groups = source.scan(dir.path(), &ctx).unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].1, Verdict::Quarantine);
+        assert_eq!(
+            progress.position(),
+            2,
+            "a quarantine-bound session's chapters must still be ticked via \
+             catch-up even though telemetry never runs for them"
+        );
+    }
+
+    // --- telemetry gating (improve-scan-and-cleanup design D2, D4, task 2.6) ---
+
+    #[test]
+    fn quarantine_bound_session_never_applies_a_usable_gps_fix() {
+        // A session with no HiLight markers under require_marker: true
+        // is Quarantine-bound; its gpmd track must never be opened, so
+        // even a chapter carrying a usable fix leaves the session on
+        // camera-clock time with no geo (design D4: verdict decided,
+        // and telemetry skipped, before the fix would ever be read).
+        let dir = tempfile::tempdir().unwrap();
+        let chapter = dir.path().join("chapter.mp4");
+        let payload = gps_payload(
+            Some("2026-07-09T23:19:48Z"),
+            true,
+            &[[515_012_340, -1_234_567, 100_000, 0, 0]],
+        );
+        write_chapter(&chapter, "2026-07-10T00:20:00Z", &[], &[payload]);
+
+        let source = GoproSource {
+            require_marker: true,
+            gps_lookup: true,
+        };
+        let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
+        let (group, verdict) = source.build_session("0006", &[(1, chapter)], &ctx);
+
+        assert_eq!(verdict, Verdict::Quarantine);
+        assert!(
+            group.geo.is_none(),
+            "a quarantine-bound session must never apply a GPS fix"
+        );
+        assert_eq!(
+            group.timestamp,
+            "2026-07-10T00:20:00Z".parse::<Timestamp>().unwrap(),
+            "timestamp must stay camera-clock, never GPS-corrected"
+        );
+    }
+
+    #[test]
+    fn skipped_telemetry_session_still_names_each_chapter_on_the_progress_bar() {
+        // Regression: when telemetry is skipped outright (quarantine-bound
+        // or gps_lookup: false), build_session used to tick the bar in
+        // bulk with no `set_message` call, leaving the "current file"
+        // label stale for the whole session — unlike derive_session_offset's
+        // loop, which names every chapter it visits. The skip branch must
+        // name each chapter too.
+        let dir = tempfile::tempdir().unwrap();
+        let chapter1 = dir.path().join("chapter1.mp4");
+        let chapter2 = dir.path().join("chapter2.mp4");
+        write_chapter(&chapter1, "2026-07-10T00:00:00Z", &[], &[]);
+        write_chapter(&chapter2, "2026-07-10T00:01:00Z", &[], &[]);
+
+        // No markers, require_marker: true -> Quarantine -> telemetry
+        // skipped for both chapters.
+        let source = GoproSource {
+            require_marker: true,
+            gps_lookup: true,
+        };
+        let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx(&ignore, &tz, imported_at, &progress);
+        let (_, verdict) = source.build_session("0009", &[(1, chapter1), (2, chapter2)], &ctx);
+
+        assert_eq!(verdict, Verdict::Quarantine);
+        assert_eq!(
+            progress.message_history(),
+            vec![
+                "session 0009: chapter1.mp4".to_string(),
+                "session 0009: chapter2.mp4".to_string(),
+            ],
+            "the progress bar must still name each chapter even though telemetry never runs"
+        );
+    }
+
+    #[test]
+    fn gps_lookup_disabled_skips_telemetry_for_a_keep_session_with_markers() {
+        // design D2: gps_lookup: false must skip telemetry even for a
+        // Keep-bound (marked) session whose chapter carries a usable fix.
+        let dir = tempfile::tempdir().unwrap();
+        let chapter = dir.path().join("chapter.mp4");
+        let payload = gps_payload(
+            Some("2026-07-09T23:19:48Z"),
+            true,
+            &[[515_012_340, -1_234_567, 100_000, 0, 0]],
+        );
+        write_chapter(&chapter, "2026-07-10T00:20:00Z", &[500], &[payload]);
+
+        let source = GoproSource {
+            require_marker: true,
+            gps_lookup: true,
+        };
+        let (ignore, tz, imported_at, progress) = test_ctx_with_tz(TimeZone::UTC);
+        let ctx = make_ctx_with_gps_lookup(&ignore, &tz, imported_at, &progress, false);
+        let (group, verdict) = source.build_session("0007", &[(1, chapter)], &ctx);
+
+        assert_eq!(verdict, Verdict::Keep, "markers alone still decide Keep");
+        assert!(
+            group.geo.is_none(),
+            "gps_lookup: false must skip telemetry even for a Keep session"
+        );
+        assert_eq!(
+            group.timestamp,
+            "2026-07-10T00:20:00Z".parse::<Timestamp>().unwrap(),
+            "timestamp must stay camera-clock when gps_lookup is disabled"
         );
     }
 }

@@ -7,10 +7,20 @@ use std::path::{Path, PathBuf};
 
 use jiff::Timestamp;
 
-use crate::config::{Profile, SourceLocation};
+use crate::config::{Profile, SourceKind, SourceLocation};
 use crate::error::{Error, Result};
 use crate::progress::Progress;
 use crate::source::{ImportSource, MediaGroup, ScanContext, Verdict};
+
+/// A GoPro profile's effective `gps_lookup` (post-override, since
+/// `profile` is always resolved before planning); `true` (a no-op) for
+/// every other device, which has no such field to read (design D2).
+fn effective_gps_lookup(kind: &SourceKind) -> bool {
+    match kind {
+        SourceKind::Gopro { gps_lookup, .. } => *gps_lookup,
+        _ => true,
+    }
+}
 
 /// A `MediaGroup` paired with its verdict and fully resolved
 /// destination (`Keep`) or quarantine (`Quarantine`) directory. Every
@@ -33,6 +43,30 @@ pub struct PlannedAction {
 #[derive(Debug, Clone, Default)]
 pub struct ImportPlan {
     pub actions: Vec<PlannedAction>,
+}
+
+/// One entry in `scan`'s source-only inventory (design D1): everything
+/// `scan` can report about a group without resolving a destination or
+/// quarantine path — structurally distinct from `PlannedAction`, so
+/// scan's absence of a path can never be confused with
+/// `PlannedAction.destination: None` (which already means something
+/// else there). `files` names every file in the group, in scan order —
+/// used by both the unrecognized-files listing and the JSON view
+/// (spec: "scan's inventory entries SHALL do the same for their file
+/// listings").
+#[derive(Debug, Clone)]
+pub struct ScanEntry {
+    pub name: String,
+    pub verdict: Verdict,
+    pub file_count: usize,
+    pub total_size: u64,
+    pub recorded_at: Timestamp,
+    pub files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ScanSummary {
+    pub entries: Vec<ScanEntry>,
 }
 
 /// Resolves the effective source root for a profile: explicit
@@ -83,6 +117,25 @@ pub fn resolve_source(
     Ok(None)
 }
 
+/// Calls `ImportSource::scan()` and drops any group with zero files
+/// (design D5) — the "no plan or scan summary ever contains a 0-file
+/// group" guarantee lives here, once, so `build_plan` and
+/// `build_scan_summary` can't drift on it. Device-agnostic: a leftover
+/// empty directory (this tool's own prior deletion, or any other
+/// cause) is filtered uniformly, regardless of which device produced
+/// it or why it's empty.
+fn scan_nonempty(
+    source_impl: &dyn ImportSource,
+    root: &Path,
+    ctx: &ScanContext,
+) -> Result<Vec<(MediaGroup, Verdict)>> {
+    let groups = source_impl.scan(root, ctx)?;
+    Ok(groups
+        .into_iter()
+        .filter(|(group, _)| !group.files.is_empty())
+        .collect())
+}
+
 /// Builds an `ImportPlan` by scanning `source_root` and resolving each
 /// group's destination or quarantine path against the profile's layout
 /// template. Fails (naming the missing field) if a `Keep` group's
@@ -100,8 +153,9 @@ pub fn build_plan(
         tz: timezone,
         imported_at: Timestamp::now(),
         progress,
+        gps_lookup: effective_gps_lookup(&profile.kind),
     };
-    let groups = source_impl.scan(source_root, &ctx)?;
+    let groups = scan_nonempty(source_impl, source_root, &ctx)?;
     tracing::info!(groups = groups.len(), "scan complete");
     let mut actions = Vec::with_capacity(groups.len());
 
@@ -140,6 +194,48 @@ pub fn build_plan(
     tracing::info!(kept, quarantined, ignored, "plan built");
 
     Ok(ImportPlan { actions })
+}
+
+/// Builds `scan`'s source-only inventory (design D1): scans
+/// `source_root` with GPS telemetry lookup unconditionally disabled
+/// (`scan` never runs it, independent of the profile's `gps_lookup`
+/// setting) and tallies each group — never resolving a destination or
+/// quarantine path, since `scan` has no business knowing where `import`
+/// would file anything.
+pub fn build_scan_summary(
+    profile: &Profile,
+    source_impl: &dyn ImportSource,
+    source_root: &Path,
+    timezone: &jiff::tz::TimeZone,
+    progress: &Progress,
+) -> Result<ScanSummary> {
+    let ctx = ScanContext {
+        ignore: &profile.ignore,
+        tz: timezone,
+        imported_at: Timestamp::now(),
+        progress,
+        gps_lookup: false,
+    };
+    let groups = scan_nonempty(source_impl, source_root, &ctx)?;
+    tracing::info!(groups = groups.len(), "scan complete");
+
+    let entries = groups
+        .into_iter()
+        .map(|(group, verdict)| ScanEntry {
+            name: group.name,
+            verdict,
+            file_count: group.files.len(),
+            total_size: group.files.iter().map(|f| f.size).sum(),
+            recorded_at: group.timestamp,
+            files: group
+                .files
+                .iter()
+                .map(|f| f.path.display().to_string())
+                .collect(),
+        })
+        .collect();
+
+    Ok(ScanSummary { entries })
 }
 
 #[cfg(test)]
@@ -189,6 +285,22 @@ mod tests {
     fn quarantine_group() -> MediaGroup {
         MediaGroup {
             name: "unmarked".to_string(),
+            files: vec![crate::source::MediaFile {
+                path: PathBuf::from("/src/unmarked/clip.mp4"),
+                size: 10,
+                recorded_at: None,
+            }],
+            timestamp: jiff::Timestamp::from_second(0).unwrap(),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        }
+    }
+
+    fn empty_group(name: &str) -> MediaGroup {
+        MediaGroup {
+            name: name.to_string(),
             files: vec![],
             timestamp: jiff::Timestamp::from_second(0).unwrap(),
             markers: vec![],
@@ -247,6 +359,124 @@ mod tests {
             action.verdict,
             Verdict::Quarantine,
             "verdict must still be Quarantine"
+        );
+    }
+
+    // --- empty-group filtering (design D5, task 4.6) ---
+
+    #[test]
+    fn zero_file_group_excluded_from_build_plan() {
+        let prof = profile_with_copy_quarantine(PathBuf::from("/dest"), true);
+        let source = StubSource {
+            groups: vec![
+                (empty_group("leftover"), Verdict::Keep),
+                (quarantine_group(), Verdict::Quarantine),
+            ],
+        };
+        let plan = build_plan(
+            &prof,
+            &source,
+            Path::new("/src"),
+            &jiff::tz::TimeZone::UTC,
+            &Progress::hidden(),
+        )
+        .unwrap();
+        assert_eq!(plan.actions.len(), 1, "the zero-file group must be dropped");
+        assert_eq!(plan.actions[0].group.name, "unmarked");
+    }
+
+    #[test]
+    fn zero_file_group_excluded_from_build_scan_summary() {
+        let prof = profile_with_copy_quarantine(PathBuf::from("/dest"), true);
+        let source = StubSource {
+            groups: vec![
+                (empty_group("leftover"), Verdict::Keep),
+                (quarantine_group(), Verdict::Quarantine),
+            ],
+        };
+        let summary = build_scan_summary(
+            &prof,
+            &source,
+            Path::new("/src"),
+            &jiff::tz::TimeZone::UTC,
+            &Progress::hidden(),
+        )
+        .unwrap();
+        assert_eq!(
+            summary.entries.len(),
+            1,
+            "the zero-file group must be dropped"
+        );
+        assert_eq!(summary.entries[0].name, "unmarked");
+    }
+
+    // --- scan summary never resolves a path (design D1, task 4.6) ---
+
+    #[test]
+    fn build_scan_summary_never_populates_a_destination_or_quarantine_path() {
+        // ScanEntry has no path field at all — this test documents the
+        // structural guarantee: a scan summary's entries carry only
+        // name, verdict, counts, and file names, regardless of verdict.
+        let prof = profile_with_copy_quarantine(PathBuf::from("/dest"), true);
+        let source = StubSource {
+            groups: vec![(quarantine_group(), Verdict::Quarantine)],
+        };
+        let summary = build_scan_summary(
+            &prof,
+            &source,
+            Path::new("/src"),
+            &jiff::tz::TimeZone::UTC,
+            &Progress::hidden(),
+        )
+        .unwrap();
+        let entry = &summary.entries[0];
+        assert_eq!(entry.verdict, Verdict::Quarantine);
+        assert_eq!(entry.file_count, 1);
+        assert_eq!(entry.total_size, 10);
+        assert_eq!(entry.files, vec!["/src/unmarked/clip.mp4".to_string()]);
+    }
+
+    #[test]
+    fn build_scan_summary_never_performs_gps_lookup() {
+        // design D1/D2: scan always passes gps_lookup: false to the
+        // device's scan(), independent of the profile's setting.
+        struct GpsLookupProbe {
+            observed: std::cell::RefCell<Option<bool>>,
+        }
+        impl ImportSource for GpsLookupProbe {
+            fn detect(&self, _root: &Path) -> bool {
+                true
+            }
+            fn scan(
+                &self,
+                _root: &Path,
+                ctx: &ScanContext,
+            ) -> error::Result<Vec<(MediaGroup, Verdict)>> {
+                *self.observed.borrow_mut() = Some(ctx.gps_lookup);
+                Ok(vec![])
+            }
+        }
+
+        let mut prof = profile_with_copy_quarantine(PathBuf::from("/dest"), true);
+        prof.kind = SourceKind::Gopro {
+            require_marker: true,
+            gps_lookup: true,
+        };
+        let source = GpsLookupProbe {
+            observed: std::cell::RefCell::new(None),
+        };
+        build_scan_summary(
+            &prof,
+            &source,
+            Path::new("/src"),
+            &jiff::tz::TimeZone::UTC,
+            &Progress::hidden(),
+        )
+        .unwrap();
+        assert_eq!(
+            *source.observed.borrow(),
+            Some(false),
+            "scan must always disable GPS lookup, even when the profile enables it"
         );
     }
 }

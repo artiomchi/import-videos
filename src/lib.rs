@@ -66,12 +66,20 @@ fn run_inner(cli: Cli) -> Result<ExitCode> {
             quick_match,
             reflink,
             no_reflink,
+            quarantine,
+            copy_quarantine,
+            no_copy_quarantine,
+            gopro_gps_lookup,
+            no_gopro_gps_lookup,
             overrides,
         } => {
             let cfg = load_config(cli.config.as_deref())?;
             let mut overrides = overrides.to_overrides();
             overrides.delete_source = cli::override_pair(delete_source, no_delete_source);
             overrides.reflink = cli::override_pair(reflink, no_reflink);
+            overrides.quarantine = quarantine;
+            overrides.copy_quarantine = cli::override_pair(copy_quarantine, no_copy_quarantine);
+            overrides.gps_lookup = cli::override_pair(gopro_gps_lookup, no_gopro_gps_lookup);
             run_import(
                 &cfg,
                 &profile,
@@ -170,10 +178,24 @@ fn apply_overrides(
         match &mut profile.kind {
             config::SourceKind::Gopro {
                 require_marker: field,
+                ..
             } => *field = require_marker,
             _ => {
                 return Err(Error::Config(format!(
                     "profile '{profile_name}': require_marker is only valid for profiles of type gopro"
+                )));
+            }
+        }
+    }
+
+    if let Some(gps_lookup) = overrides.gps_lookup {
+        match &mut profile.kind {
+            config::SourceKind::Gopro {
+                gps_lookup: field, ..
+            } => *field = gps_lookup,
+            _ => {
+                return Err(Error::Config(format!(
+                    "profile '{profile_name}': gps_lookup is only valid for profiles of type gopro"
                 )));
             }
         }
@@ -184,18 +206,21 @@ fn apply_overrides(
 
 /// Resolves a source and builds a plan for the already-resolved
 /// `profile` (overrides applied — task 2.4, plan/transfer/report stay
-/// override-unaware), handling the two "nothing to do" cases (`scan`
-/// and `import` share this exactly: spec requires `import` build "the
-/// same plan `scan` would"). `scan_progress` reports the scan phase's
-/// progress (add-scan-progress design D1, D4) — its enabled/hidden
-/// state is decided once by the caller, never re-derived here.
-/// `Ok(None)` means the caller should report "nothing found" and stop.
+/// override-unaware), handling the "nothing to do" case. Used only by
+/// `run_import` now (`run_scan` builds its own source-only inventory
+/// via `build_scan_summary` — design D1). `scan_progress` reports the
+/// scan phase's progress (add-scan-progress design D1, D4) — its
+/// enabled/hidden state is decided once by the caller, never re-derived
+/// here. `Ok(None)` means the caller should report "nothing found" and
+/// stop. Returns the resolved source root alongside the plan (design
+/// D6) so the caller can pass it to `transfer::execute` as the
+/// directory-pruning boundary.
 fn scan_profile(
     cfg: &config::Config,
     profile: &config::Profile,
     source_override: Option<&Path>,
     scan_progress: &progress::Progress,
-) -> Result<Option<plan::ImportPlan>> {
+) -> Result<Option<(std::path::PathBuf, plan::ImportPlan)>> {
     let source_impl = profile.kind.build();
 
     let Some(root) = plan::resolve_source(
@@ -218,7 +243,7 @@ fn scan_profile(
     if import_plan.actions.is_empty() {
         return Ok(None);
     }
-    Ok(Some(import_plan))
+    Ok(Some((root, import_plan)))
 }
 
 /// Prints "no sources found" as a bare string, or — under `--json` — as
@@ -250,6 +275,19 @@ fn print_plan(plan: &plan::ImportPlan, verbose: bool, tz: &jiff::tz::TimeZone, j
     }
 }
 
+fn print_scan_summary(
+    summary: &plan::ScanSummary,
+    verbose: bool,
+    tz: &jiff::tz::TimeZone,
+    json: bool,
+) {
+    if json {
+        print_json(&report::scan_summary_to_json(summary, tz));
+    } else {
+        print!("{}", report::render_scan_summary(summary, verbose, tz));
+    }
+}
+
 /// Progress bars are visible only on an interactive terminal with
 /// JSON output off (design D6) — never interleaved with piped or
 /// machine-readable output. Decided once per command and threaded
@@ -258,6 +296,11 @@ fn scan_progress_enabled(json: bool) -> bool {
     std::io::stdout().is_terminal() && !json
 }
 
+/// `scan` diverges from `import`/`--dry-run` (design D1, D7): it builds
+/// a source-only inventory via `build_scan_summary` instead of sharing
+/// `scan_profile`/`build_plan` — it never resolves a destination or
+/// quarantine path and never performs GPS lookup, so there is no
+/// `ImportPlan` to reuse here.
 fn run_scan(
     cfg: &config::Config,
     profile_name: &str,
@@ -267,10 +310,32 @@ fn run_scan(
     json: bool,
 ) -> Result<ExitCode> {
     let profile = resolve_profile(cfg, profile_name, overrides)?;
+    let source_impl = profile.kind.build();
+
+    let Some(root) = plan::resolve_source(
+        &profile,
+        source_override,
+        source_impl.as_ref(),
+        &cfg.mount_roots,
+    )?
+    else {
+        print_no_sources(profile_name, json);
+        return Ok(ExitCode::Success);
+    };
+
     let scan_progress = progress::Progress::counted(scan_progress_enabled(json), "Scanning");
-    match scan_profile(cfg, &profile, source_override, &scan_progress)? {
-        None => print_no_sources(profile_name, json),
-        Some(import_plan) => print_plan(&import_plan, verbose, &cfg.timezone, json),
+    let summary = plan::build_scan_summary(
+        &profile,
+        source_impl.as_ref(),
+        &root,
+        &cfg.timezone,
+        &scan_progress,
+    )?;
+
+    if summary.entries.is_empty() {
+        print_no_sources(profile_name, json);
+    } else {
+        print_scan_summary(&summary, verbose, &cfg.timezone, json);
     }
     Ok(ExitCode::Success)
 }
@@ -290,7 +355,9 @@ fn run_import(
     let profile = resolve_profile(cfg, profile_name, overrides)?;
 
     let scan_progress = progress::Progress::counted(scan_progress_enabled(json), "Scanning");
-    let Some(import_plan) = scan_profile(cfg, &profile, source_override, &scan_progress)? else {
+    let Some((source_root, import_plan)) =
+        scan_profile(cfg, &profile, source_override, &scan_progress)?
+    else {
         print_no_sources(profile_name, json);
         return Ok(ExitCode::Success);
     };
@@ -316,6 +383,7 @@ fn run_import(
 
     let exec_report = transfer::execute(
         &import_plan,
+        &source_root,
         profile.delete_source,
         assume_yes,
         quick_match,

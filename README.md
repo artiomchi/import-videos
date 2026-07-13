@@ -6,9 +6,12 @@ decide what's worth keeping — for example, only pulling GoPro clips that
 have a HiLight marker, or Tesla dashcam clips tied to a sentry/honk event —
 and quarantines everything else instead of deleting it outright.
 
-Every import is **scan → plan → execute**: a read-only scan produces a plan
-(what will be kept, quarantined, or ignored, and why); nothing is copied,
-moved, or deleted until you review that plan and run `import`.
+Every import is **scan → plan → execute**: read-only discovery decides what
+will be kept, quarantined, or ignored, and why; nothing is copied, moved, or
+deleted until you run `import`. `scan` is a fast, read-only source inventory;
+`import --dry-run` resolves and prints the real plan — where each group will
+actually land, including GPS-corrected timestamps — so it's the one to run
+when you need the exact preview (see "`scan` / `import`" below).
 
 GoPro HERO8 and Tesla dashcam/sentry footage are supported today; other
 devices follow in later changesets. See "What gets kept" below for each
@@ -79,6 +82,7 @@ fails config loading):
 | Field            | Type    | Meaning                                                                 |
 | ---------------- | ------- | ------------------------------------------------------------------------ |
 | `require_marker` | `gopro` | Whether a session needs a HiLight marker to be kept (default `true`)     |
+| `gps_lookup`     | `gopro` | Whether `import` runs GPS telemetry lookup at all (default `true`). `scan` never runs it regardless of this setting. Disabling it skips telemetry entirely; a session falls back to camera-clock time exactly as when telemetry finds no usable fix |
 | `events`         | `tesla` | Event categories to import: any of `saved`, `sentry`, `recent` (default `[saved, sentry]`) |
 | `reasons`        | `tesla` | `allow: [...]` or `deny: [...]` (not both) — filters by `event.json`'s trigger `reason` |
 
@@ -124,6 +128,13 @@ behavior: camera-clock timestamp, `"time_source": "camera"`, each marker's
 timestamp in the configured timezone. A telemetry problem is logged and
 never fails or requeues an import — it only ever affects timestamps, never
 the Keep/Quarantine verdict.
+
+`import` skips telemetry lookup entirely for a session that will end up
+`Quarantine`d — its destination never uses the timestamp, so there's nothing
+to correct — and for any session when `gps_lookup: false` (or the
+`--no-gopro-gps-lookup` override) is set. `scan` never performs telemetry
+lookup at all, regardless of `gps_lookup`, since it never shows a
+timestamp-dependent path in the first place.
 
 Destination dates are resolved in the configured `timezone` (default: system
 timezone). Set `timezone: UTC` in the config to get UTC-based folder names,
@@ -171,11 +182,23 @@ loads, not partway through an import.
 
 ### `scan` / `import`
 
-Always scan before importing — it's read-only and shows exactly what
-`import` would do:
+`scan` and `import` answer different questions. `scan` is a fast, read-only
+source inventory: it never resolves a destination or quarantine path and
+never runs GoPro GPS telemetry lookup, so it's cheap even on a large card.
+`import --dry-run` is the exact, resolved preview of what a real `import`
+will do — including destination/quarantine paths and (for GoPro, unless
+disabled) GPS-corrected timestamps — so it's slower but authoritative. Since
+GPS correction can occasionally move a session across a day boundary,
+`scan`'s inventory may name a different day than the destination path
+`import` actually resolves and uses; treat `scan` as "what's on the card",
+and `import --dry-run` as "exactly what will happen":
 
 ```sh
 import-videos scan commute
+```
+
+```sh
+import-videos import commute --dry-run
 ```
 
 ```sh
@@ -183,19 +206,22 @@ import-videos import commute
 ```
 
 Both `scan` and `import` show a per-chapter/session scan-phase progress
-indicator while a card is being read, appearing before the plan is printed
-and clearing once scanning finishes. `import` additionally shows a byte-level
-progress bar for the transfer phase, after the plan is built — the two never
-appear at once. Both are shown only while stdout is an interactive terminal
-and `--json` is off; either is silent (no progress, no terminal-control
-bytes) when stdout is piped or `--json` is set, so scripted and redirected
-runs stay clean.
+indicator while a card is being read, appearing before the inventory or plan
+is printed and clearing once scanning finishes. `import` additionally shows
+a byte-level progress bar for the transfer phase, after the plan is built —
+the two never appear at once. Both are shown only while stdout is an
+interactive terminal and `--json` is off; either is silent (no progress, no
+terminal-control bytes) when stdout is piped or `--json` is set, so scripted
+and redirected runs stay clean.
 
 Useful flags:
 
 - `--source PATH` — use this path instead of the profile's configured source
-- `--dry-run` — print the plan and stop (same as `scan`, but via `import`)
+  (`scan`, `import`)
+- `--dry-run` — resolve and print the real plan, then stop (`import` only —
+  `scan` never resolves a plan to begin with)
 - `--yes` — skip the confirmation prompt before deleting source files
+  (`import`)
 - `--quick-match` — skip content hashing when the destination file's name,
   size, and mtime match within 0.1 s of the source's recording time. Useful
   for regenerating `import.json` on already-imported footage without
@@ -205,6 +231,13 @@ Useful flags:
 - `--reflink` / `--no-reflink` — force copy-on-write cloning on or off for
   this run (default `true`, see the `reflink` config field above). A clone
   is verified by construction and remains a source-deletion candidate.
+
+When `delete_source` is in effect, a verified deletion also prunes any
+source directory the deletion leaves empty, walking upward until it hits a
+non-empty directory or the scanned source root — the source root itself is
+never removed, and a directory that turns out not to be truly empty (or a
+filesystem error) simply stops the pruning there rather than failing the
+import.
 
 #### Per-invocation overrides
 
@@ -218,15 +251,21 @@ passing both resolves to whichever came last:
 | Flag                          | Subcommands    | Overrides                                                                 |
 | ------------------------------ | -------------- | -------------------------------------------------------------------------- |
 | `--delete-source` / `--no-delete-source` | `import`       | `delete_source`, in either direction. Forcing deletion on still requires confirmation (`--yes` or the prompt); quick-matched files are still never deletion candidates. `--keep-source` is a hidden alias of `--no-delete-source`, kept for old scripts and muscle memory. |
-| `--copy-quarantine` / `--no-copy-quarantine` | `scan`, `import` | `copy_quarantine`, in either direction |
-| `--quarantine PATH`            | `scan`, `import` | The profile's quarantine directory for this run. A relative path resolves against `destination`, same as the config field. Also forces `copy_quarantine` on — combining it with `--no-copy-quarantine` is a usage error (exit 2) |
+| `--copy-quarantine` / `--no-copy-quarantine` | `import` | `copy_quarantine`, in either direction |
+| `--quarantine PATH`            | `import` | The profile's quarantine directory for this run. A relative path resolves against `destination`, same as the config field. Also forces `copy_quarantine` on — combining it with `--no-copy-quarantine` is a usage error (exit 2) |
 | `--gopro-require-marker` / `--no-gopro-require-marker` | `scan`, `import` | `require_marker`, in either direction. Rejected (exit 2) on a non-`gopro` profile, with the same wording config loading uses |
+| `--gopro-gps-lookup` / `--no-gopro-gps-lookup` | `import` | `gps_lookup`, in either direction. Rejected (exit 2) on a non-`gopro` profile |
 | `--reflink` / `--no-reflink`   | `import`       | `reflink`, in either direction. Only affects same-filesystem transfers; elsewhere the run already falls back to a stream copy regardless |
 
-`--quarantine` and `--copy-quarantine`/`--no-copy-quarantine` also work on
-`scan` since they change what the plan shows; `--delete-source` only
-affects execution, so it's `import`-only. Overrides apply before planning,
-so `scan`, `import --dry-run`, and `import` all reflect them identically.
+`--gopro-require-marker`/`--no-gopro-require-marker` is the one override that
+still works on `scan`, since it changes the verdict counts `scan`'s inventory
+reports. Every other override — `--quarantine`, `--copy-quarantine`/
+`--no-copy-quarantine`, `--reflink`/`--no-reflink`, `--delete-source`/
+`--no-delete-source`, and `--gopro-gps-lookup`/`--no-gopro-gps-lookup` — is
+`import`-only and a usage error (exit 2) on `scan`, since `scan` never
+resolves or shows a destination/quarantine path and never performs GPS
+lookup. Overrides apply before planning, so `import --dry-run` and `import`
+always reflect them identically.
 
 ### `cleanup`
 
@@ -282,9 +321,10 @@ unsupported path (anything that's neither) is a usage error, exit 2.
   go to stderr and exit codes are unchanged. Confirmation prompts still
   apply — `--json` does not imply `--yes`. See "JSON output" below for the
   shape.
-- `-v` / `-vv` — increase log verbosity; also expands the plan output (`scan` /
-  `import --dry-run`): shows quarantined sessions and per-marker details,
-  which are otherwise collapsed into the closing summary line
+- `-v` / `-vv` — increase log verbosity; also expands the inventory/plan
+  output (`scan`, `import --dry-run`, and a non-dry-run `import`'s printed
+  plan): shows quarantined sessions and per-marker details, which are
+  otherwise collapsed into the closing summary line
 - `--config PATH` — use a config file other than the default
 
 Exit codes: `0` success (including "nothing to import" / "nothing to
@@ -302,7 +342,12 @@ not by serializing internal domain types directly, so the shape is
 deliberate rather than an accident of refactoring. Timestamps are RFC 3339
 strings in the configured timezone; paths are strings.
 
-- `scan --json` / `import --dry-run --json` — the plan: `actions[]` (group,
+- `scan --json` — the source-only inventory: `entries[]` (group, verdict,
+  reason, file count, total size, recorded time, and every file name — no
+  `path` field anywhere, since `scan` never resolves one) and a `summary`
+  (kept/quarantined/ignored/total counts). Unlike the human output,
+  quarantined entries are always included.
+- `import --dry-run --json` — the resolved plan: `actions[]` (group,
   verdict, reason, path, markers, sidecar path) and a `summary` (kept/
   quarantined/ignored/total counts). Unlike the human output, quarantined
   entries are always included.

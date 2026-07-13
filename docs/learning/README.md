@@ -21,3 +21,4 @@ Keep notes under a page. Link related ADRs.
 - [Serde view-models vs. deriving on domain types](serde-view-models-vs-domain-types.md) — `report.rs`'s `PlanJson`/`ResultsJson`, and why the JSON contract isn't derived onto `ImportPlan`/`ExecuteReport` directly
 - [A custom `tracing` writer, and `OnceLock` for shared global state](makewriter-and-global-state.md) — `cli.rs`'s `MakeWriter` impl and `progress.rs`'s `OnceLock<MultiProgress>` registry
 - [Copy-on-write reflinks](copy-on-write-reflink.md) — `FICLONE`, why it's neither a copy nor a hard link, and mirroring `std::fs::copy`'s signature for a clean fallback seam
+- [Canonicalized path boundaries](canonicalized-path-boundaries.md) — why `Path::starts_with` alone can't safely gate a destructive "is this inside that directory?" check, and `transfer.rs`'s directory-pruning boundary

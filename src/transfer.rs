@@ -128,8 +128,12 @@ fn sidecar_ok(outcome: &Option<TransferOutcome>) -> bool {
 /// folded in any `--delete-source`/`--no-delete-source` override at
 /// profile resolution (design D5), so this function stays
 /// override-unaware.
+/// `source_root` is the scanned source's root (design D6) — the
+/// boundary directory-pruning after verified deletion is never allowed
+/// to remove, even once everything under it is gone.
 pub fn execute(
     plan: &ImportPlan,
+    source_root: &Path,
     delete_source: bool,
     assume_yes: bool,
     quick_match: bool,
@@ -144,6 +148,7 @@ pub fn execute(
     // and an in-process test can never hang waiting on stdin.
     execute_inner(
         plan,
+        source_root,
         delete_source,
         assume_yes,
         quick_match,
@@ -153,8 +158,10 @@ pub fn execute(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_inner(
     plan: &ImportPlan,
+    source_root: &Path,
     delete_source: bool,
     assume_yes: bool,
     quick_match: bool,
@@ -280,10 +287,25 @@ fn execute_inner(
                             && group.files.iter().all(|f| content_verified(&f.outcome))
                             && sidecar_ok(&group.sidecar_outcome);
                         if all_ok {
+                            let mut parent_dirs: Vec<PathBuf> = Vec::new();
                             for file in &group.files {
                                 let _ = fs::remove_file(&file.src);
+                                if let Some(parent) = file.src.parent() {
+                                    let parent = parent.to_path_buf();
+                                    if !parent_dirs.contains(&parent) {
+                                        parent_dirs.push(parent);
+                                    }
+                                }
                             }
                             group.deleted_from_source = true;
+                            // Directory pruning is metadata-tier cleanup
+                            // (design D6): it runs once per distinct
+                            // parent directory of the files just
+                            // deleted, after every file in the group is
+                            // gone.
+                            for dir in &parent_dirs {
+                                prune_empty_ancestors(dir, source_root);
+                            }
                         }
                     }
                 }
@@ -306,6 +328,46 @@ fn execute_inner(
         deletion_skipped_reason,
         delete_source,
     })
+}
+
+/// After a group's files are deleted, removes `dir` (a deleted file's
+/// parent) if it is now empty, then climbs upward removing each
+/// successive ancestor while it is also empty — stopping strictly
+/// before `source_root`, which is never removed even if it becomes
+/// empty (design D6). Both `dir` and `source_root` are canonicalized
+/// before comparing, so a symlink or relative-path edge case can't
+/// produce a false "still inside the boundary" result. A directory that
+/// can't be removed (not actually empty, or a filesystem error) simply
+/// stops the climb at that point — this is metadata-tier cleanup, not
+/// correctness-critical, so a pruning failure never fails the import or
+/// surfaces as a transfer error (same tier as `stamp_mtime`'s "log and
+/// move on").
+fn prune_empty_ancestors(dir: &Path, source_root: &Path) {
+    let Ok(source_root) = source_root.canonicalize() else {
+        return;
+    };
+    let mut current = dir.to_path_buf();
+    loop {
+        let Ok(canonical) = current.canonicalize() else {
+            return;
+        };
+        if canonical == source_root || !canonical.starts_with(&source_root) {
+            return;
+        }
+        if let Err(error) = fs::remove_dir(&canonical) {
+            tracing::debug!(
+                dir = %canonical.display(),
+                %error,
+                "stopped pruning empty source directories"
+            );
+            return;
+        }
+        tracing::debug!(dir = %canonical.display(), "pruned empty source directory");
+        let Some(parent) = canonical.parent() else {
+            return;
+        };
+        current = parent.to_path_buf();
+    }
 }
 
 pub enum Confirmation {
@@ -810,8 +872,17 @@ mod tests {
             }],
         };
 
-        let report =
-            execute_inner(&plan, true, false, false, false, false, &Progress::hidden()).unwrap();
+        let report = execute_inner(
+            &plan,
+            dir.path(),
+            true,
+            false,
+            false,
+            false,
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
 
         assert!(src.exists(), "deletion must be skipped, not assumed");
         assert!(!report.groups[0].deleted_from_source);
@@ -865,7 +936,7 @@ mod tests {
         };
 
         let progress = Progress::hidden();
-        let report = execute(&plan, false, false, false, false, &progress).unwrap();
+        let report = execute(&plan, dir.path(), false, false, false, false, &progress).unwrap();
         assert!(matches!(
             report.groups[0].files[0].outcome,
             TransferOutcome::Transferred
@@ -920,8 +991,17 @@ mod tests {
             }],
         };
 
-        let report =
-            execute_inner(&plan, true, true, false, false, false, &Progress::hidden()).unwrap();
+        let report = execute_inner(
+            &plan,
+            dir.path(),
+            true,
+            true,
+            false,
+            false,
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
 
         let dest_path = dest_dir.join("clip.mp4");
         assert_eq!(fs::read(&dest_path).unwrap(), b"hello world");
@@ -1018,7 +1098,16 @@ mod tests {
             }],
         };
 
-        execute(&plan, false, false, false, false, &Progress::hidden()).unwrap();
+        execute(
+            &plan,
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
 
         let mtime = fs::metadata(quarantine_dir.join("clip.mp4"))
             .unwrap()
@@ -1113,7 +1202,16 @@ mod tests {
             }],
         };
 
-        let report = execute(&plan, false, false, false, false, &Progress::hidden()).unwrap();
+        let report = execute(
+            &plan,
+            dir.path(),
+            false,
+            false,
+            false,
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
 
         assert!(matches!(
             report.groups[0].sidecar_outcome,
@@ -1146,7 +1244,16 @@ mod tests {
             }],
         };
 
-        let report = execute(&plan, true, true, false, false, &Progress::hidden()).unwrap();
+        let report = execute(
+            &plan,
+            dir.path(),
+            true,
+            true,
+            false,
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
 
         assert!(matches!(
             report.groups[0].sidecar_outcome,
@@ -1267,7 +1374,7 @@ mod tests {
         };
 
         let progress = Progress::new(true, "Importing");
-        let report = execute(&plan, false, false, false, false, &progress).unwrap();
+        let report = execute(&plan, dir.path(), false, false, false, false, &progress).unwrap();
         assert!(matches!(
             report.groups[0].files[0].outcome,
             TransferOutcome::SkippedIdentical
@@ -1317,7 +1424,7 @@ mod tests {
         };
 
         let progress = Progress::new(true, "Importing");
-        let report = execute(&plan, false, false, true, false, &progress).unwrap();
+        let report = execute(&plan, dir.path(), false, false, true, false, &progress).unwrap();
         assert!(matches!(
             report.groups[0].files[0].outcome,
             TransferOutcome::SkippedQuickMatch
@@ -1458,8 +1565,17 @@ mod tests {
             }],
         };
 
-        let report =
-            execute_inner(&plan, true, true, false, true, false, &Progress::hidden()).unwrap();
+        let report = execute_inner(
+            &plan,
+            dir.path(),
+            true,
+            true,
+            false,
+            true,
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
 
         assert!(matches!(
             report.groups[0].files[0].outcome,
@@ -1512,11 +1628,218 @@ mod tests {
         };
 
         let progress = Progress::new(true, "Importing");
-        let report = execute(&plan, false, false, false, true, &progress).unwrap();
+        let report = execute(&plan, dir.path(), false, false, false, true, &progress).unwrap();
         assert!(matches!(
             report.groups[0].files[0].outcome,
             TransferOutcome::Reflinked
         ));
         assert_eq!(progress.position(), content.len() as u64);
+    }
+
+    // --- directory pruning after verified deletion (design D6, task 6.4) ---
+
+    fn single_file_keep_plan(src: &Path, dest_dir: &Path) -> ImportPlan {
+        let group = MediaGroup {
+            name: "a".to_string(),
+            files: vec![MediaFile {
+                path: src.to_path_buf(),
+                size: 5,
+                recorded_at: None,
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        ImportPlan {
+            actions: vec![PlannedAction {
+                group,
+                verdict: Verdict::Keep,
+                destination: Some(dest_dir.to_path_buf()),
+                quarantine_path: None,
+            }],
+        }
+    }
+
+    #[test]
+    fn emptied_subdirectory_is_removed_after_deletion() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_root = dir.path().join("source");
+        let src = source_root.join("sub").join("clip.mp4");
+        fs::create_dir_all(src.parent().unwrap()).unwrap();
+        fs::write(&src, b"hello").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let plan = single_file_keep_plan(&src, &dest_dir);
+        execute_inner(
+            &plan,
+            &source_root,
+            true,
+            true,
+            false,
+            false,
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
+
+        assert!(
+            !src.parent().unwrap().exists(),
+            "emptied subdirectory should be pruned"
+        );
+        assert!(source_root.exists(), "source root itself must remain");
+    }
+
+    #[test]
+    fn source_root_itself_is_never_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_root = dir.path().join("source");
+        fs::create_dir_all(&source_root).unwrap();
+        let src = source_root.join("clip.mp4");
+        fs::write(&src, b"hello").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let plan = single_file_keep_plan(&src, &dest_dir);
+        execute_inner(
+            &plan,
+            &source_root,
+            true,
+            true,
+            false,
+            false,
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
+
+        assert!(!src.exists());
+        assert!(
+            source_root.exists(),
+            "the source root must never be removed even when it becomes empty"
+        );
+    }
+
+    #[test]
+    fn pruning_stops_at_a_directory_still_holding_another_groups_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_root = dir.path().join("source");
+        let sub = source_root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let a_src = sub.join("a.mp4");
+        let b_src = sub.join("b.mp4");
+        fs::write(&a_src, b"hello").unwrap();
+        fs::write(&b_src, b"world").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let group_a = MediaGroup {
+            name: "a".to_string(),
+            files: vec![MediaFile {
+                path: a_src.clone(),
+                size: 5,
+                recorded_at: None,
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+        // group b's file is never a deletion candidate (Ignore verdict),
+        // so it stays behind and keeps `sub` non-empty.
+        let group_b = MediaGroup {
+            name: "b".to_string(),
+            files: vec![MediaFile {
+                path: b_src.clone(),
+                size: 5,
+                recorded_at: None,
+            }],
+            timestamp: ts(0),
+            markers: vec![],
+            geo: None,
+            context: HashMap::new(),
+            sidecar: None,
+        };
+
+        let plan = ImportPlan {
+            actions: vec![
+                PlannedAction {
+                    group: group_a,
+                    verdict: Verdict::Keep,
+                    destination: Some(dest_dir.clone()),
+                    quarantine_path: None,
+                },
+                PlannedAction {
+                    group: group_b,
+                    verdict: Verdict::Ignore("unrecognized file(s)".to_string()),
+                    destination: None,
+                    quarantine_path: None,
+                },
+            ],
+        };
+
+        execute_inner(
+            &plan,
+            &source_root,
+            true,
+            true,
+            false,
+            false,
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
+
+        assert!(!a_src.exists(), "group a's file should be deleted");
+        assert!(
+            b_src.exists(),
+            "group b's file was never a deletion candidate and must remain"
+        );
+        assert!(sub.exists(), "sub must remain since it still holds b.mp4");
+    }
+
+    #[test]
+    fn pruning_failure_does_not_fail_the_import_or_report_a_transfer_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_root = dir.path().join("source");
+        let sub = source_root.join("sub");
+        fs::create_dir_all(&sub).unwrap();
+        let src = sub.join("clip.mp4");
+        fs::write(&src, b"hello").unwrap();
+        // A file the scan never saw — stands in for anything that keeps
+        // the directory non-empty after the group's own file is gone,
+        // so `fs::remove_dir` fails and pruning simply stops there.
+        fs::write(sub.join(".hidden"), b"stray").unwrap();
+        let dest_dir = dir.path().join("dest");
+
+        let plan = single_file_keep_plan(&src, &dest_dir);
+        let report = execute_inner(
+            &plan,
+            &source_root,
+            true,
+            true,
+            false,
+            false,
+            false,
+            &Progress::hidden(),
+        )
+        .unwrap();
+
+        assert!(!src.exists());
+        assert!(
+            sub.exists(),
+            "pruning must stop when the directory isn't actually empty"
+        );
+        assert!(
+            report.groups[0].deleted_from_source,
+            "a pruning failure must not undo the group's own deletion success"
+        );
+        assert!(
+            !report.groups[0]
+                .files
+                .iter()
+                .any(|f| matches!(f.outcome, TransferOutcome::Failed(_))),
+            "a pruning failure must never surface as a transfer error"
+        );
     }
 }

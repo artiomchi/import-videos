@@ -350,7 +350,11 @@ fn quarantine_and_no_copy_quarantine_is_a_usage_error_before_scanning() {
 }
 
 #[test]
-fn scan_previews_the_quarantine_override_without_touching_disk() {
+fn scan_quarantine_override_is_a_usage_error() {
+    // improve-scan-and-cleanup design D1/D7: scan never resolves or
+    // shows a quarantine path, so --quarantine (and --copy-quarantine/
+    // --no-copy-quarantine) moved off scan's flag set entirely — this
+    // now fails to parse instead of being silently previewed.
     let dir = tempfile::tempdir().unwrap();
     let card = dir.path().join("card");
     write_card(&card);
@@ -375,12 +379,7 @@ fn scan_previews_the_quarantine_override_without_touching_disk() {
         .stdin(Stdio::null())
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(0));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.contains(redirected.to_str().unwrap()),
-        "scan must show the overridden quarantine path in the plan: {stdout}"
-    );
+    assert_eq!(output.status.code(), Some(2));
     assert!(!dest.exists(), "scan must not create the destination");
     assert!(
         !redirected.exists(),

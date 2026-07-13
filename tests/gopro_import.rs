@@ -554,9 +554,33 @@ fn verbose_flag_unlocks_info_milestones_a_default_run_does_not_emit() {
         verbose_stderr.contains("scan complete"),
         "got: {verbose_stderr}"
     );
+    // improve-scan-and-cleanup design D1: scan builds a source-only
+    // inventory via `build_scan_summary`, not a plan — "plan built" is
+    // only ever logged by `build_plan`, which only `import` calls now.
     assert!(
-        verbose_stderr.contains("plan built"),
-        "got: {verbose_stderr}"
+        !verbose_stderr.contains("plan built"),
+        "scan never builds a plan: {verbose_stderr}"
+    );
+
+    let verbose_dry_run_output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "-v",
+            "import",
+            "gopro",
+            "--source",
+            card.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(verbose_dry_run_output.status.code(), Some(0));
+    let dry_run_stderr = String::from_utf8_lossy(&verbose_dry_run_output.stderr);
+    assert!(
+        dry_run_stderr.contains("plan built"),
+        "import --dry-run builds a real plan: {dry_run_stderr}"
     );
 }
 

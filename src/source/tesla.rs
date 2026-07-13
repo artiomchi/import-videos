@@ -582,6 +582,7 @@ mod tests {
             tz,
             imported_at,
             progress,
+            gps_lookup: true,
         }
     }
 
