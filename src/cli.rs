@@ -29,6 +29,14 @@ pub struct Cli {
     /// text; suppresses progress and informational lines (design D4)
     #[arg(long, global = true)]
     pub json: bool,
+
+    /// Collapse per-group/per-entry listings on scan, import, and
+    /// cleanup to progress bars plus a closing summary/tally line.
+    /// Combines with `-v`: its diagnostic-logging effect keeps working,
+    /// but `--summary` overrides off its render-detail effect. A no-op
+    /// under `--json`.
+    #[arg(long, global = true)]
+    pub summary: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -399,5 +407,33 @@ mod tests {
         // baseline alongside the new scan-only-usage-error tests above.
         let result = Cli::try_parse_from(["import-videos", "scan", "cam", "--reflink"]);
         assert!(result.is_err());
+    }
+
+    // --- --summary flag parsing (add-summary-flag, task 1.2) ---
+
+    #[test]
+    fn summary_flag_parses_on_scan() {
+        let cli = parse(&["scan", "cam", "--summary"]);
+        assert!(cli.summary);
+    }
+
+    #[test]
+    fn summary_flag_parses_on_import() {
+        let cli = parse(&["import", "cam", "--summary"]);
+        assert!(cli.summary);
+    }
+
+    #[test]
+    fn summary_flag_parses_on_cleanup() {
+        let cli = parse(&["cleanup", "cam", "--summary"]);
+        assert!(cli.summary);
+    }
+
+    #[test]
+    fn summary_combines_with_verbose_and_json_without_conflict() {
+        let cli = parse(&["import", "cam", "--summary", "-v", "--json"]);
+        assert!(cli.summary);
+        assert_eq!(cli.verbose, 1);
+        assert!(cli.json);
     }
 }

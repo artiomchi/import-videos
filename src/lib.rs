@@ -44,7 +44,13 @@ pub fn run() -> i32 {
 /// actually needed (design D5) — `inspect` operates on a bare path and
 /// must work with no config file present at all.
 fn run_inner(cli: Cli) -> Result<ExitCode> {
-    let verbose = cli.verbose > 0;
+    let detail = if cli.summary {
+        report::Detail::Summary
+    } else if cli.verbose > 0 {
+        report::Detail::Verbose
+    } else {
+        report::Detail::Normal
+    };
     let json = cli.json;
 
     match cli.command {
@@ -55,7 +61,7 @@ fn run_inner(cli: Cli) -> Result<ExitCode> {
         } => {
             let cfg = load_config(cli.config.as_deref())?;
             let overrides = overrides.to_overrides();
-            run_scan(&cfg, &profile, source.as_deref(), &overrides, verbose, json)
+            run_scan(&cfg, &profile, source.as_deref(), &overrides, detail, json)
         }
         Command::Import {
             profile,
@@ -89,7 +95,7 @@ fn run_inner(cli: Cli) -> Result<ExitCode> {
                 &overrides,
                 yes,
                 quick_match,
-                verbose,
+                detail,
                 json,
             )
         }
@@ -100,7 +106,15 @@ fn run_inner(cli: Cli) -> Result<ExitCode> {
             yes,
         } => {
             let cfg = load_config(cli.config.as_deref())?;
-            run_cleanup(&cfg, &profile, older_than.as_deref(), dry_run, yes, json)
+            run_cleanup(
+                &cfg,
+                &profile,
+                older_than.as_deref(),
+                dry_run,
+                yes,
+                detail,
+                json,
+            )
         }
         Command::Inspect { path } => run_inspect(&path, json),
     }
@@ -343,7 +357,7 @@ fn run_scan_cycle(
     source_impl: &dyn ImportSource,
     source_root: &Path,
     tz: &jiff::tz::TimeZone,
-    verbose: bool,
+    detail: report::Detail,
     json: bool,
 ) -> Result<ScanDriveOutcome> {
     let scan_progress = progress::Progress::counted(scan_progress_enabled(json), "Scanning");
@@ -353,7 +367,7 @@ fn run_scan_cycle(
         return Ok(ScanDriveOutcome::Empty);
     }
     if !json {
-        print_scan_summary(&summary, verbose, tz, json);
+        print_scan_summary(&summary, detail, tz, json);
     }
     Ok(ScanDriveOutcome::Found(summary))
 }
@@ -377,7 +391,7 @@ fn run_import_cycle(
     assume_yes: bool,
     quick_match: bool,
     tz: &jiff::tz::TimeZone,
-    verbose: bool,
+    detail: report::Detail,
     json: bool,
 ) -> Result<ImportDriveOutcome> {
     let scan_progress = progress::Progress::counted(scan_progress_enabled(json), "Scanning");
@@ -389,7 +403,7 @@ fn run_import_cycle(
 
     if dry_run {
         if !json {
-            print_plan(&import_plan, verbose, tz, json);
+            print_plan(&import_plan, detail, tz, json);
         }
         return Ok(ImportDriveOutcome::Planned(import_plan));
     }
@@ -398,7 +412,7 @@ fn run_import_cycle(
     // transferring anything (improve-console-output design D4): the
     // same plan `scan` would print.
     if !json {
-        print_plan(&import_plan, verbose, tz, json);
+        print_plan(&import_plan, detail, tz, json);
     }
 
     // A separate, byte-oriented Progress for the transfer phase (design
@@ -416,7 +430,7 @@ fn run_import_cycle(
     )?;
 
     if !json {
-        print!("{}", report::render_results(&exec_report, verbose));
+        print!("{}", report::render_results(&exec_report, detail));
     }
 
     let any_failed = report_any_failed(&exec_report);
@@ -437,7 +451,7 @@ pub fn scan_drives(
     source_impl: &dyn ImportSource,
     drives: &[plan::DetectedSource],
     tz: &jiff::tz::TimeZone,
-    verbose: bool,
+    detail: report::Detail,
     json: bool,
 ) -> Vec<DriveResult<ScanDriveOutcome>> {
     drives
@@ -446,13 +460,13 @@ pub fn scan_drives(
             if !json {
                 print_drive_header(&drive.name, &drive.path);
             }
-            let result = run_scan_cycle(profile, source_impl, &drive.path, tz, verbose, json);
+            let result = run_scan_cycle(profile, source_impl, &drive.path, tz, detail, json);
             if !json {
                 match &result {
                     Ok(ScanDriveOutcome::Empty) => {
                         print!(
                             "{}",
-                            report::render_scan_summary(&plan::ScanSummary::default(), verbose, tz)
+                            report::render_scan_summary(&plan::ScanSummary::default(), detail, tz)
                         );
                     }
                     Ok(ScanDriveOutcome::Found(_)) => {}
@@ -482,7 +496,7 @@ pub fn import_drives(
     assume_yes: bool,
     quick_match: bool,
     tz: &jiff::tz::TimeZone,
-    verbose: bool,
+    detail: report::Detail,
     json: bool,
 ) -> Vec<DriveResult<ImportDriveOutcome>> {
     drives
@@ -499,7 +513,7 @@ pub fn import_drives(
                 assume_yes,
                 quick_match,
                 tz,
-                verbose,
+                detail,
                 json,
             );
             if !json {
@@ -507,7 +521,7 @@ pub fn import_drives(
                     Ok(ImportDriveOutcome::Empty) => {
                         print!(
                             "{}",
-                            report::render_plan(&plan::ImportPlan::default(), verbose, tz)
+                            report::render_plan(&plan::ImportPlan::default(), detail, tz)
                         );
                     }
                     Ok(_) => {}
@@ -544,24 +558,29 @@ fn print_json(value: &impl serde::Serialize) {
     );
 }
 
-fn print_plan(plan: &plan::ImportPlan, verbose: bool, tz: &jiff::tz::TimeZone, json: bool) {
+fn print_plan(
+    plan: &plan::ImportPlan,
+    detail: report::Detail,
+    tz: &jiff::tz::TimeZone,
+    json: bool,
+) {
     if json {
         print_json(&report::plan_to_json(plan, tz));
     } else {
-        print!("{}", report::render_plan(plan, verbose, tz));
+        print!("{}", report::render_plan(plan, detail, tz));
     }
 }
 
 fn print_scan_summary(
     summary: &plan::ScanSummary,
-    verbose: bool,
+    detail: report::Detail,
     tz: &jiff::tz::TimeZone,
     json: bool,
 ) {
     if json {
         print_json(&report::scan_summary_to_json(summary, tz));
     } else {
-        print!("{}", report::render_scan_summary(summary, verbose, tz));
+        print!("{}", report::render_scan_summary(summary, detail, tz));
     }
 }
 
@@ -585,7 +604,7 @@ fn run_scan(
     profile_name: &str,
     source_override: Option<&Path>,
     overrides: &cli::Overrides,
-    verbose: bool,
+    detail: report::Detail,
     json: bool,
 ) -> Result<ExitCode> {
     let profile = resolve_profile(cfg, profile_name, overrides)?;
@@ -603,7 +622,7 @@ fn run_scan(
                 source_impl.as_ref(),
                 &root,
                 &cfg.timezone,
-                verbose,
+                detail,
                 json,
             )? {
                 ScanDriveOutcome::Empty => print_no_sources(profile_name, json),
@@ -625,7 +644,7 @@ fn run_scan(
                 source_impl.as_ref(),
                 &drives,
                 &cfg.timezone,
-                verbose,
+                detail,
                 json,
             );
             let any_error = results.iter().any(|r| r.result.is_err());
@@ -661,7 +680,7 @@ fn run_import(
     overrides: &cli::Overrides,
     assume_yes: bool,
     quick_match: bool,
-    verbose: bool,
+    detail: report::Detail,
     json: bool,
 ) -> Result<ExitCode> {
     let profile = resolve_profile(cfg, profile_name, overrides)?;
@@ -682,7 +701,7 @@ fn run_import(
                 assume_yes,
                 quick_match,
                 &cfg.timezone,
-                verbose,
+                detail,
                 json,
             )? {
                 ImportDriveOutcome::Empty => {
@@ -720,7 +739,7 @@ fn run_import(
                 assume_yes,
                 quick_match,
                 &cfg.timezone,
-                verbose,
+                detail,
                 json,
             );
             let any_failed = any_import_drive_failed(&results);
@@ -748,11 +767,11 @@ fn parse_older_than(raw: &str) -> Result<jiff::Span> {
         .map_err(|e| Error::Config(format!("--older-than: invalid span '{raw}': {e}")))
 }
 
-fn print_cleanup_plan(plan: &cleanup::CleanupPlan, json: bool) {
+fn print_cleanup_plan(plan: &cleanup::CleanupPlan, detail: report::Detail, json: bool) {
     if json {
         print_json(&report::cleanup_plan_to_json(plan));
     } else {
-        print!("{}", report::render_cleanup_plan(plan));
+        print!("{}", report::render_cleanup_plan(plan, detail));
     }
 }
 
@@ -762,6 +781,7 @@ fn run_cleanup(
     older_than: Option<&str>,
     dry_run: bool,
     assume_yes: bool,
+    detail: report::Detail,
     json: bool,
 ) -> Result<ExitCode> {
     let profile = get_profile(cfg, profile_name)?;
@@ -770,12 +790,12 @@ fn run_cleanup(
     let plan = cleanup::build_plan(profile, older_than, &cfg.timezone, jiff::Timestamp::now())?;
 
     if plan.entries.is_empty() || dry_run {
-        print_cleanup_plan(&plan, json);
+        print_cleanup_plan(&plan, detail, json);
         return Ok(ExitCode::Success);
     }
 
     if !json {
-        print!("{}", report::render_cleanup_plan(&plan));
+        print!("{}", report::render_cleanup_plan(&plan, detail));
     }
 
     let exec_report = cleanup::execute(&plan, assume_yes)?;
@@ -783,7 +803,7 @@ fn run_cleanup(
     if json {
         print_json(&report::cleanup_report_to_json(&exec_report));
     } else {
-        print!("{}", report::render_cleanup_report(&exec_report));
+        print!("{}", report::render_cleanup_report(&exec_report, detail));
     }
 
     let any_failed = exec_report.results.iter().any(|r| !r.deleted);

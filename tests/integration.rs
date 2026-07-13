@@ -1077,8 +1077,8 @@ fn multi_drive_import_continues_past_a_hard_error_on_one_drive() {
         true,  // assume_yes
         false, // quick_match
         &jiff::tz::TimeZone::UTC,
-        false, // verbose
-        false, // json
+        report::Detail::Normal, // detail
+        false,                  // json
     );
 
     assert_eq!(results.len(), 3);
@@ -1200,7 +1200,7 @@ fn multi_drive_import_continues_past_a_transfer_failure_on_one_drive() {
         true,
         false,
         &jiff::tz::TimeZone::UTC,
-        false,
+        report::Detail::Normal,
         false,
     );
 
@@ -1299,8 +1299,8 @@ fn multi_drive_scan_continues_past_a_hard_error_on_one_drive() {
         &source_impl,
         &drives,
         &jiff::tz::TimeZone::UTC,
-        false, // verbose
-        false, // json
+        report::Detail::Normal, // detail
+        false,                  // json
     );
 
     assert_eq!(results.len(), 3);
@@ -1377,7 +1377,7 @@ fn multi_drive_empty_drive_is_reported_distinctly_and_does_not_affect_others() {
         &source_impl,
         &drives,
         &jiff::tz::TimeZone::UTC,
-        false,
+        report::Detail::Normal,
         false,
     );
     assert!(matches!(
@@ -1407,7 +1407,7 @@ fn multi_drive_empty_drive_is_reported_distinctly_and_does_not_affect_others() {
         true,
         false,
         &jiff::tz::TimeZone::UTC,
-        false,
+        report::Detail::Normal,
         false,
     );
     assert!(matches!(
@@ -1504,7 +1504,7 @@ fn multi_drive_import_prompts_independently_per_drive_when_non_interactive() {
         false,
         false,
         &jiff::tz::TimeZone::UTC,
-        false,
+        report::Detail::Normal,
         false,
     );
 

@@ -28,6 +28,21 @@ const SHORT_TIME_FORMAT: &str = "%Y-%m-%d %H:%M";
 const UNRECOGNIZED_REASON: &str = "unrecognized file(s)";
 const UNRECOGNIZED_DEFAULT_CAP: usize = 5;
 
+/// Render-detail tier for plan/results/cleanup rendering (design
+/// Decision 1): replaces a plain `verbose: bool` so the illegal state
+/// "both summary and verbose" is unconstructable rather than merely
+/// convention. Computed once in `lib.rs` from `cli.summary`/`cli.verbose`
+/// and threaded down; `report.rs` never reads `-v`'s log-level effect,
+/// only this.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum Detail {
+    /// Progress bars plus a closing summary/tally line only — no
+    /// per-group or per-entry listing.
+    Summary,
+    Normal,
+    Verbose,
+}
+
 /// Formats `n` with `word` pluralized the plain way (`"1 file"`,
 /// `"3 files"`) — every count in the plan/results renderers goes
 /// through this so wording stays consistent.
@@ -133,7 +148,7 @@ impl VerdictTotals {
 /// capped at 5 by default. A summary line with per-verdict file/byte
 /// totals always closes the output, so counts stay visible even when
 /// entries are aggregated or capped.
-pub fn render_plan(plan: &ImportPlan, verbose: bool, tz: &TimeZone) -> String {
+pub fn render_plan(plan: &ImportPlan, detail: Detail, tz: &TimeZone) -> String {
     if plan.actions.is_empty() {
         return "No media found; nothing to import.\n".to_string();
     }
@@ -147,15 +162,17 @@ pub fn render_plan(plan: &ImportPlan, verbose: bool, tz: &TimeZone) -> String {
 
         if matches!(action.verdict, Verdict::Quarantine) {
             quarantine_entries.push(action);
-            if !verbose {
+            if detail != Detail::Verbose {
                 continue;
             }
         }
 
-        render_plan_entry(&mut out, action, verbose, tz);
+        if detail != Detail::Summary {
+            render_plan_entry(&mut out, action, detail, tz);
+        }
     }
 
-    if !verbose && !quarantine_entries.is_empty() {
+    if detail == Detail::Normal && !quarantine_entries.is_empty() {
         render_quarantine_rollup(&mut out, &quarantine_entries);
     }
 
@@ -170,7 +187,7 @@ pub fn render_plan(plan: &ImportPlan, verbose: bool, tz: &TimeZone) -> String {
 /// fixed-string exception, per design D5. Verbose-only detail (full
 /// RFC 3339 time, markers, sidecar filename) follows on indented
 /// lines.
-fn render_plan_entry(out: &mut String, action: &PlannedAction, verbose: bool, tz: &TimeZone) {
+fn render_plan_entry(out: &mut String, action: &PlannedAction, detail: Detail, tz: &TimeZone) {
     let label = match &action.verdict {
         Verdict::Keep => "KEEP",
         Verdict::Quarantine => "QUARANTINE",
@@ -190,7 +207,7 @@ fn render_plan_entry(out: &mut String, action: &PlannedAction, verbose: bool, tz
     let is_unrecognized =
         matches!(&action.verdict, Verdict::Ignore(reason) if reason == UNRECOGNIZED_REASON);
     if is_unrecognized {
-        render_unrecognized_files(out, &action.group.files, verbose);
+        render_unrecognized_files(out, &action.group.files, detail);
     } else if !matches!(action.verdict, Verdict::Ignore(_)) {
         let group_bytes: u64 = action.group.files.iter().map(|f| f.size).sum();
         let short_time = format_short_ts(action.group.timestamp, tz);
@@ -211,7 +228,7 @@ fn render_plan_entry(out: &mut String, action: &PlannedAction, verbose: bool, tz
     }
     let _ = writeln!(out);
 
-    if verbose {
+    if detail == Detail::Verbose {
         let _ = write!(
             out,
             "  recorded at: {}",
@@ -244,33 +261,36 @@ fn format_short_ts(ts: Timestamp, tz: &TimeZone) -> String {
 /// (design D6). The count lands in the entry line itself; a trailing
 /// "… and N more" line appears only when the cap actually truncates —
 /// at or under the cap, default and verbose output are identical.
-fn render_unrecognized_files(out: &mut String, files: &[MediaFile], verbose: bool) {
+fn render_unrecognized_files(out: &mut String, files: &[MediaFile], detail: Detail) {
     let names: Vec<String> = files.iter().map(|f| file_display_name(&f.path)).collect();
-    render_file_name_list(out, names, verbose);
+    render_file_name_list(out, names, detail);
 }
 
 /// Same rendering as `render_unrecognized_files`, from a scan entry's
 /// already-collected file path strings (design D1) rather than a live
 /// `&[MediaFile]` slice.
-fn render_scan_unrecognized_files(out: &mut String, files: &[String], verbose: bool) {
+fn render_scan_unrecognized_files(out: &mut String, files: &[String], detail: Detail) {
     let names: Vec<String> = files
         .iter()
         .map(|f| file_display_name(Path::new(f)))
         .collect();
-    render_file_name_list(out, names, verbose);
+    render_file_name_list(out, names, detail);
 }
 
 /// Shared body of `render_unrecognized_files`/`render_scan_unrecognized_files`
 /// (design D6, task 5.1): sorts, caps at `UNRECOGNIZED_DEFAULT_CAP`
-/// unless `verbose`, and appends a "… and N more" line only when the
-/// cap actually truncates.
-fn render_file_name_list(out: &mut String, mut names: Vec<String>, verbose: bool) {
+/// unless `Detail::Verbose`, and appends a "… and N more (-v to list
+/// all)" line only when the cap actually truncates. Never called under
+/// `Detail::Summary` — the unrecognized-files listing is omitted
+/// entirely in that mode (design Decision 2), same as every other
+/// per-action listing.
+fn render_file_name_list(out: &mut String, mut names: Vec<String>, detail: Detail) {
     names.sort();
 
     let _ = write!(out, " ({})", plural(names.len(), "file"));
     let _ = writeln!(out);
 
-    let shown = if verbose {
+    let shown = if detail == Detail::Verbose {
         names.len()
     } else {
         names.len().min(UNRECOGNIZED_DEFAULT_CAP)
@@ -328,7 +348,7 @@ fn render_quarantine_rollup(out: &mut String, entries: &[&PlannedAction]) {
 /// verdict-tally / unrecognized-files-cap conventions `render_plan`
 /// uses, but with no per-entry destination or quarantine path —
 /// `ScanEntry` is structurally incapable of carrying one.
-pub fn render_scan_summary(summary: &ScanSummary, verbose: bool, tz: &TimeZone) -> String {
+pub fn render_scan_summary(summary: &ScanSummary, detail: Detail, tz: &TimeZone) -> String {
     if summary.entries.is_empty() {
         return "No media found; nothing to import.\n".to_string();
     }
@@ -342,15 +362,17 @@ pub fn render_scan_summary(summary: &ScanSummary, verbose: bool, tz: &TimeZone) 
 
         if matches!(entry.verdict, Verdict::Quarantine) {
             quarantine_entries.push(entry);
-            if !verbose {
+            if detail != Detail::Verbose {
                 continue;
             }
         }
 
-        render_scan_entry(&mut out, entry, verbose, tz);
+        if detail != Detail::Summary {
+            render_scan_entry(&mut out, entry, detail, tz);
+        }
     }
 
-    if !verbose && !quarantine_entries.is_empty() {
+    if detail == Detail::Normal && !quarantine_entries.is_empty() {
         render_scan_quarantine_rollup(&mut out, &quarantine_entries);
     }
 
@@ -364,7 +386,7 @@ pub fn render_scan_summary(summary: &ScanSummary, verbose: bool, tz: &TimeZone) 
 /// recorded time, file count, and total size — no path, ever
 /// (design D1). `Ignore`'s reason clause is the only fixed-string
 /// exception, matching `render_plan_entry`.
-fn render_scan_entry(out: &mut String, entry: &ScanEntry, verbose: bool, tz: &TimeZone) {
+fn render_scan_entry(out: &mut String, entry: &ScanEntry, detail: Detail, tz: &TimeZone) {
     let label = match &entry.verdict {
         Verdict::Keep => "KEEP",
         Verdict::Quarantine => "QUARANTINE",
@@ -379,7 +401,7 @@ fn render_scan_entry(out: &mut String, entry: &ScanEntry, verbose: bool, tz: &Ti
     let is_unrecognized =
         matches!(&entry.verdict, Verdict::Ignore(reason) if reason == UNRECOGNIZED_REASON);
     if is_unrecognized {
-        render_scan_unrecognized_files(out, &entry.files, verbose);
+        render_scan_unrecognized_files(out, &entry.files, detail);
     } else if !matches!(entry.verdict, Verdict::Ignore(_)) {
         let short_time = format_short_ts(entry.recorded_at, tz);
         let _ = write!(
@@ -391,7 +413,7 @@ fn render_scan_entry(out: &mut String, entry: &ScanEntry, verbose: bool, tz: &Ti
     }
     let _ = writeln!(out);
 
-    if verbose && !is_unrecognized {
+    if detail == Detail::Verbose && !is_unrecognized {
         let _ = writeln!(out, "  recorded at: {}", format_ts(entry.recorded_at, tz));
     }
 }
@@ -475,7 +497,7 @@ impl ResultsTally {
     /// when deletion was actually requested this run — showing "0
     /// deleted from source" on a run that never asked for deletion
     /// would read as a failure that never happened.
-    fn summary_line(&self, delete_source_in_effect: bool) -> String {
+    fn summary_line(&self, delete_source_in_effect: bool, detail: Detail) -> String {
         let mut line = format!(
             "Summary: {} transferred, {} reflinked, {} skipped (already imported), {} quick-matched, {} FAILED",
             self.transferred,
@@ -491,6 +513,22 @@ impl ResultsTally {
                 plural(self.deleted_groups, "group")
             );
         }
+        // Only Detail::Summary folds these two per-file outcomes into
+        // the summary line (design Decision 3) — default/verbose output
+        // lists them individually instead, via render_group_notable, so
+        // adding these clauses there would double-report the same files.
+        if detail == Detail::Summary {
+            if self.suffixed > 0 {
+                let _ = write!(line, ", {} renamed (collision)", self.suffixed);
+            }
+            if self.skipped_quarantine_disabled > 0 {
+                let _ = write!(
+                    line,
+                    ", {} left on source (quarantine copying disabled)",
+                    self.skipped_quarantine_disabled
+                );
+            }
+        }
         line
     }
 }
@@ -503,7 +541,7 @@ impl ResultsTally {
 /// quick-matched) are counted but not listed. `-v` lists every file,
 /// grouped per media group with the group's destination as a header. A
 /// summary line always closes the output.
-pub fn render_results(report: &ExecuteReport, verbose: bool) -> String {
+pub fn render_results(report: &ExecuteReport, detail: Detail) -> String {
     let tally = ResultsTally::from_report(report);
     let mut out = String::new();
 
@@ -515,10 +553,10 @@ pub fn render_results(report: &ExecuteReport, verbose: bool) -> String {
     let name_undeleted_groups = report.delete_source && report.deletion_skipped_reason.is_none();
 
     for group in &report.groups {
-        if verbose {
+        if detail == Detail::Verbose {
             render_group_verbose(&mut out, group);
         } else {
-            render_group_notable(&mut out, group, name_undeleted_groups);
+            render_group_notable(&mut out, group, name_undeleted_groups, detail);
         }
     }
 
@@ -526,7 +564,7 @@ pub fn render_results(report: &ExecuteReport, verbose: bool) -> String {
         let _ = writeln!(out, "{reason}");
     }
 
-    let _ = writeln!(out, "{}", tally.summary_line(report.delete_source));
+    let _ = writeln!(out, "{}", tally.summary_line(report.delete_source, detail));
     out
 }
 
@@ -558,14 +596,21 @@ fn file_outcome_line(file: &FileResult, include_name: bool) -> String {
 /// surfacing without `-v` (design D7) — routine per-file lines
 /// (`Transferred`, `SkippedIdentical`, `SkippedQuickMatch`) are
 /// omitted, counted only in the summary.
-fn render_group_notable(out: &mut String, group: &GroupResult, name_undeleted_groups: bool) {
+fn render_group_notable(
+    out: &mut String,
+    group: &GroupResult,
+    name_undeleted_groups: bool,
+    detail: Detail,
+) {
     for file in &group.files {
-        if matches!(
-            file.outcome,
-            TransferOutcome::Suffixed(_)
-                | TransferOutcome::SkippedQuarantineDisabled
-                | TransferOutcome::Failed(_)
-        ) {
+        let notable = match file.outcome {
+            TransferOutcome::Failed(_) => true,
+            TransferOutcome::Suffixed(_) | TransferOutcome::SkippedQuarantineDisabled => {
+                detail != Detail::Summary
+            }
+            _ => false,
+        };
+        if notable {
             let _ = writeln!(out, "{}", file_outcome_line(file, true));
         }
     }
@@ -1116,7 +1161,7 @@ fn format_age_days(age_seconds: i64) -> String {
 /// Renders a purge plan: every entry with its age and size, marked
 /// kept or purge-candidate, closed with a summary line (design D1,
 /// task 3.5).
-pub fn render_cleanup_plan(plan: &crate::cleanup::CleanupPlan) -> String {
+pub fn render_cleanup_plan(plan: &crate::cleanup::CleanupPlan, detail: Detail) -> String {
     if plan.entries.is_empty() {
         return format!("Nothing to clean in {}\n", plan.quarantine_root.display());
     }
@@ -1135,13 +1180,15 @@ pub fn render_cleanup_plan(plan: &crate::cleanup::CleanupPlan) -> String {
             keep_count += 1;
             keep_size += entry.size;
         }
-        let _ = writeln!(
-            out,
-            "[{label}] {} — {} old, {}",
-            entry.name,
-            format_age_days(entry.age_seconds),
-            format_size(entry.size)
-        );
+        if detail != Detail::Summary {
+            let _ = writeln!(
+                out,
+                "[{label}] {} — {} old, {}",
+                entry.name,
+                format_age_days(entry.age_seconds),
+                format_size(entry.size)
+            );
+        }
     }
 
     let _ = writeln!(
@@ -1153,19 +1200,45 @@ pub fn render_cleanup_plan(plan: &crate::cleanup::CleanupPlan) -> String {
     out
 }
 
-/// Renders the outcome of executing a cleanup plan.
-pub fn render_cleanup_report(report: &crate::cleanup::CleanupReport) -> String {
+/// Renders the outcome of executing a cleanup plan. Default mode lists
+/// every deleted entry individually with no closing tally (an existing
+/// asymmetry with `render_results` left out of scope — see design's Open
+/// Questions). `Detail::Summary` replaces the routine `deleted: <path>`
+/// lines with a closing tally (count and total size); `FAILED to
+/// delete` lines stay individually listed in every `Detail` value, since
+/// they're the actionable exception this flag is not meant to hide.
+pub fn render_cleanup_report(report: &crate::cleanup::CleanupReport, detail: Detail) -> String {
     let mut out = String::new();
+    let (mut deleted_count, mut deleted_size) = (0usize, 0u64);
+
     for result in &report.results {
         match &result.error {
             None => {
-                let _ = writeln!(out, "deleted: {}", result.path.display());
+                deleted_count += 1;
+                deleted_size += result.size;
+                if detail != Detail::Summary {
+                    let _ = writeln!(out, "deleted: {}", result.path.display());
+                }
             }
             Some(message) => {
                 let _ = writeln!(out, "FAILED to delete {}: {message}", result.path.display());
             }
         }
     }
+
+    if detail == Detail::Summary && deleted_count > 0 {
+        let noun = if deleted_count == 1 {
+            "entry"
+        } else {
+            "entries"
+        };
+        let _ = writeln!(
+            out,
+            "Summary: {deleted_count} {noun} deleted ({})",
+            format_size(deleted_size)
+        );
+    }
+
     if let Some(reason) = &report.aborted_reason {
         let _ = writeln!(out, "{reason}");
     }
@@ -1502,7 +1575,7 @@ mod tests {
         }];
         let plan = plan_with_one_keep_one_quarantine(markers);
 
-        let out = render_plan(&plan, false, &jiff::tz::TimeZone::UTC);
+        let out = render_plan(&plan, Detail::Normal, &jiff::tz::TimeZone::UTC);
 
         assert!(out.contains("[KEEP] kept"));
         assert!(!out.contains("QUARANTINE"));
@@ -1528,7 +1601,7 @@ mod tests {
             }],
         };
 
-        let out = render_plan(&plan, false, &jiff::tz::TimeZone::UTC);
+        let out = render_plan(&plan, Detail::Normal, &jiff::tz::TimeZone::UTC);
 
         assert!(
             !out.contains("[QUARANTINE]"),
@@ -1545,7 +1618,7 @@ mod tests {
         }];
         let plan = plan_with_one_keep_one_quarantine(markers);
 
-        let out = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
+        let out = render_plan(&plan, Detail::Verbose, &jiff::tz::TimeZone::UTC);
 
         assert!(out.contains("[KEEP] kept"));
         assert!(out.contains("[QUARANTINE] unmarked"));
@@ -1566,7 +1639,7 @@ mod tests {
     #[test]
     fn recorded_at_has_no_source_annotation_without_a_sidecar() {
         let plan = plan_with_one_keep_one_quarantine(vec![]);
-        let out = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
+        let out = render_plan(&plan, Detail::Verbose, &jiff::tz::TimeZone::UTC);
         assert!(!out.contains("(source:"));
     }
 
@@ -1586,7 +1659,7 @@ mod tests {
             }],
         };
 
-        let out = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
+        let out = render_plan(&plan, Detail::Verbose, &jiff::tz::TimeZone::UTC);
 
         assert!(out.contains("recorded at: 1970-01-01T00:00:00+00:00 (source: gps)"));
     }
@@ -1605,7 +1678,7 @@ mod tests {
             }],
         };
 
-        let out_verbose = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
+        let out_verbose = render_plan(&plan, Detail::Verbose, &jiff::tz::TimeZone::UTC);
         assert!(
             out_verbose.contains("[QUARANTINE] unmarked"),
             "verbose must show the quarantine entry"
@@ -1665,7 +1738,7 @@ mod tests {
             delete_source: false,
         };
 
-        let out = render_results(&report, false);
+        let out = render_results(&report, Detail::Normal);
         assert!(out.contains("left on source (quarantine copy disabled): /card/clip.mp4"));
     }
 
@@ -1693,7 +1766,7 @@ mod tests {
             delete_source: true,
         };
 
-        let out = render_results(&report, false);
+        let out = render_results(&report, Detail::Normal);
         assert_eq!(
             out.trim_end(),
             "Summary: 1 transferred, 0 reflinked, 1 skipped (already imported), 0 quick-matched, 0 FAILED, 2 groups deleted from source"
@@ -1724,7 +1797,7 @@ mod tests {
             delete_source: true,
         };
 
-        let out = render_results(&report, false);
+        let out = render_results(&report, Detail::Normal);
         assert!(out.contains("FAILED: /card/broken.mp4 (hash mismatch)"));
         assert!(
             out.contains("broken: not deleted from source (broken.mp4 failed to transfer)"),
@@ -1755,7 +1828,7 @@ mod tests {
             delete_source: false,
         };
 
-        let out = render_results(&report, false);
+        let out = render_results(&report, Detail::Normal);
         assert!(out.contains("FAILED: /card/a.mp4"));
         assert!(
             !out.contains("not deleted from source"),
@@ -1780,7 +1853,7 @@ mod tests {
             delete_source: true,
         };
 
-        let out = render_results(&report, true);
+        let out = render_results(&report, Detail::Verbose);
         let lines: Vec<&str> = out.lines().collect();
         assert_eq!(lines[0], "session-a -> /dest/2026/2026-07-09");
         assert_eq!(lines[1], "  transferred: clip1.mp4");
@@ -1811,7 +1884,7 @@ mod tests {
             delete_source: false,
         };
 
-        let out = render_results(&report, false);
+        let out = render_results(&report, Detail::Normal);
         assert_eq!(
             out.trim_end(),
             "Summary: 1 transferred, 1 reflinked, 0 skipped (already imported), 0 quick-matched, 0 FAILED"
@@ -1835,7 +1908,7 @@ mod tests {
             delete_source: true,
         };
 
-        let out = render_results(&report, true);
+        let out = render_results(&report, Detail::Verbose);
         assert!(out.contains("reflinked (instant): a1.mp4"));
     }
 
@@ -1887,7 +1960,7 @@ mod tests {
             delete_source: true,
         };
 
-        let human = render_results(&report, false);
+        let human = render_results(&report, Detail::Normal);
         let json = results_to_json(&report);
 
         assert!(human.contains(&format!("{} transferred", json.summary.transferred)));
@@ -1991,7 +2064,7 @@ mod tests {
             }],
         };
 
-        let out = render_plan(&plan, false, &jiff::tz::TimeZone::UTC);
+        let out = render_plan(&plan, Detail::Normal, &jiff::tz::TimeZone::UTC);
 
         assert!(
             out.contains("[KEEP] kept  2026-07-09 07:41  2 files, 2.0 KiB -> /dest/kept"),
@@ -2031,7 +2104,7 @@ mod tests {
     #[test]
     fn unrecognized_files_capped_at_five_by_default() {
         let plan = unrecognized_plan(8);
-        let out = render_plan(&plan, false, &jiff::tz::TimeZone::UTC);
+        let out = render_plan(&plan, Detail::Normal, &jiff::tz::TimeZone::UTC);
 
         assert!(out.contains("[IGNORE] unrecognized — unrecognized file(s) (8 files)"));
         for i in 0..5 {
@@ -2046,7 +2119,7 @@ mod tests {
     #[test]
     fn unrecognized_files_all_listed_with_verbose() {
         let plan = unrecognized_plan(8);
-        let out = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
+        let out = render_plan(&plan, Detail::Verbose, &jiff::tz::TimeZone::UTC);
 
         for i in 0..8 {
             assert!(out.contains(&format!("stray{i:02}.dat")), "{out}");
@@ -2057,8 +2130,8 @@ mod tests {
     #[test]
     fn unrecognized_files_at_cap_render_identically_default_and_verbose() {
         let plan = unrecognized_plan(5);
-        let default_out = render_plan(&plan, false, &jiff::tz::TimeZone::UTC);
-        let verbose_out = render_plan(&plan, true, &jiff::tz::TimeZone::UTC);
+        let default_out = render_plan(&plan, Detail::Normal, &jiff::tz::TimeZone::UTC);
+        let verbose_out = render_plan(&plan, Detail::Verbose, &jiff::tz::TimeZone::UTC);
 
         assert!(!default_out.contains("more (-v to list all)"));
         for i in 0..5 {
@@ -2161,7 +2234,7 @@ mod tests {
             entries: vec![scan_entry("session-0123", Verdict::Keep, 2, 2048)],
         };
 
-        let out = render_scan_summary(&summary, false, &jiff::tz::TimeZone::UTC);
+        let out = render_scan_summary(&summary, Detail::Normal, &jiff::tz::TimeZone::UTC);
 
         assert!(
             out.contains("[KEEP] session-0123  2026-07-09 07:41  2 files, 2.0 KiB"),
@@ -2182,7 +2255,7 @@ mod tests {
             ],
         };
 
-        let out = render_scan_summary(&summary, false, &jiff::tz::TimeZone::UTC);
+        let out = render_scan_summary(&summary, Detail::Normal, &jiff::tz::TimeZone::UTC);
 
         assert!(
             !out.contains("[QUARANTINE]"),
@@ -2212,7 +2285,7 @@ mod tests {
             }],
         };
 
-        let default_out = render_scan_summary(&summary, false, &jiff::tz::TimeZone::UTC);
+        let default_out = render_scan_summary(&summary, Detail::Normal, &jiff::tz::TimeZone::UTC);
         assert!(default_out.contains("[IGNORE] unrecognized — unrecognized file(s) (8 files)"));
         for i in 0..5 {
             assert!(
@@ -2228,7 +2301,7 @@ mod tests {
         }
         assert!(default_out.contains("… and 3 more (-v to list all)"));
 
-        let verbose_out = render_scan_summary(&summary, true, &jiff::tz::TimeZone::UTC);
+        let verbose_out = render_scan_summary(&summary, Detail::Verbose, &jiff::tz::TimeZone::UTC);
         for i in 0..8 {
             assert!(
                 verbose_out.contains(&format!("stray{i:02}.dat")),

@@ -60,6 +60,10 @@ pub struct CleanupResult {
     pub path: PathBuf,
     pub deleted: bool,
     pub error: Option<String>,
+    /// The entry's size, carried through from `CleanupEntry` so
+    /// `render_cleanup_report`'s `Detail::Summary` tally can total the
+    /// bytes actually deleted without re-reading the filesystem.
+    pub size: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -213,6 +217,7 @@ fn execute_inner(
                         path: entry.path.clone(),
                         deleted: outcome.is_ok(),
                         error: outcome.err().map(|e| e.to_string()),
+                        size: entry.size,
                     }
                 })
                 .collect();
