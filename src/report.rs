@@ -979,6 +979,121 @@ pub fn results_to_json(report: &ExecuteReport) -> ResultsJson {
     }
 }
 
+// --- multi-drive JSON (multi-drive-import design D4, task 4.1-4.3) ---
+//
+// Explicit sourcing keeps printing `ScanSummaryJson`/`PlanJson`/
+// `ResultsJson` directly at the top level, byte-for-byte as before this
+// capability (task 2.5, 4.4) — these wrapper types are only ever used
+// for `source: auto`, where more than zero drives can exist in the same
+// invocation. `error`/`summary`/`plan`/`results` are omitted from the
+// serialized JSON entirely (not merely `null`) when absent, via
+// `skip_serializing_if`, matching the spec's "an error-status drive's
+// entry has no summary/plan/results key".
+
+#[derive(Debug, Serialize)]
+pub struct ScanDriveJson {
+    pub name: String,
+    pub path: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary: Option<ScanSummaryJson>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MultiScanJson {
+    pub drives: Vec<ScanDriveJson>,
+}
+
+/// Builds one drive's JSON entry for `scan --json` against a
+/// `source: auto` profile (spec: "Multi-drive JSON output enumerates
+/// every drive"). `result` is the `Result<ScanDriveOutcome>` `scan_drives`
+/// recorded for this drive — `Err` becomes `status: "error"` with the
+/// error's `Display` text and no `summary` key.
+pub fn scan_drive_json(
+    name: &str,
+    path: &Path,
+    result: &crate::error::Result<crate::ScanDriveOutcome>,
+    tz: &TimeZone,
+) -> ScanDriveJson {
+    let (status, error, summary) = match result {
+        Ok(crate::ScanDriveOutcome::Empty) => ("empty".to_string(), None, None),
+        Ok(crate::ScanDriveOutcome::Found(summary)) => (
+            "completed".to_string(),
+            None,
+            Some(scan_summary_to_json(summary, tz)),
+        ),
+        Err(e) => ("error".to_string(), Some(e.to_string()), None),
+    };
+    ScanDriveJson {
+        name: name.to_string(),
+        path: path.display().to_string(),
+        status,
+        error,
+        summary,
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ImportDriveJson {
+    pub name: String,
+    pub path: String,
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plan: Option<PlanJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub results: Option<ResultsJson>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct MultiImportJson {
+    pub drives: Vec<ImportDriveJson>,
+    pub any_failed: bool,
+}
+
+/// Builds one drive's JSON entry for `import --json` (`--dry-run` or a
+/// real run) against a `source: auto` profile. `plan`/`results` mirror
+/// whichever payload a single-drive JSON response would carry for that
+/// mode — never both for the same drive.
+pub fn import_drive_json(
+    name: &str,
+    path: &Path,
+    result: &crate::error::Result<crate::ImportDriveOutcome>,
+    tz: &TimeZone,
+) -> ImportDriveJson {
+    let (status, error, plan, results) = match result {
+        Ok(crate::ImportDriveOutcome::Empty) => ("empty".to_string(), None, None, None),
+        Ok(crate::ImportDriveOutcome::Planned(plan)) => (
+            "completed".to_string(),
+            None,
+            Some(plan_to_json(plan, tz)),
+            None,
+        ),
+        Ok(crate::ImportDriveOutcome::Executed { report, any_failed }) => (
+            if *any_failed {
+                "completed_with_failures".to_string()
+            } else {
+                "completed".to_string()
+            },
+            None,
+            None,
+            Some(results_to_json(report)),
+        ),
+        Err(e) => ("error".to_string(), Some(e.to_string()), None, None),
+    };
+    ImportDriveJson {
+        name: name.to_string(),
+        path: path.display().to_string(),
+        status,
+        error,
+        plan,
+        results,
+    }
+}
+
 // --- cleanup (cli-maintenance) ---
 
 /// Renders a human-readable size in bytes, KiB, MiB, or GiB — whichever

@@ -69,6 +69,53 @@ pub struct ScanSummary {
     pub entries: Vec<ScanEntry>,
 }
 
+/// One volume detected under `mount_roots` for a `source: auto` profile
+/// (multi-drive-import design D1): its display name (mount-point
+/// directory basename — the same name Linux automounters like udisks2
+/// already derive from the volume label, design Context) and full
+/// resolved path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DetectedSource {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+/// Multi-drive counterpart to `resolve_source`, `source: auto` only
+/// (design D1): walks every `mount_roots` entry exactly as
+/// `resolve_source` does, but collects *every* directory
+/// `source_impl.detect()` accepts instead of stopping at the first
+/// match, then orders the result by path (design D5) so processing
+/// order and "drive N of M" numbering stay reproducible across runs
+/// regardless of `read_dir`'s unspecified order. Never fails — zero
+/// matches is an empty `Vec`, mirroring `resolve_source`'s `Ok(None)`.
+pub fn resolve_sources(
+    source_impl: &dyn ImportSource,
+    mount_roots: &[PathBuf],
+) -> Vec<DetectedSource> {
+    let mut found = Vec::new();
+    for root in mount_roots {
+        let Ok(entries) = std::fs::read_dir(root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let candidate = entry.path();
+            if candidate.is_dir() && source_impl.detect(&candidate) {
+                let name = candidate
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| candidate.display().to_string());
+                tracing::info!(source = %candidate.display(), "source resolved");
+                found.push(DetectedSource {
+                    name,
+                    path: candidate,
+                });
+            }
+        }
+    }
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found
+}
+
 /// Resolves the effective source root for a profile: explicit
 /// `--source` overrides the profile; the profile's own `source: <path>`
 /// is used as-is; `source: auto` probes `mount_roots` and offers each
@@ -78,6 +125,11 @@ pub struct ScanSummary {
 /// caller reports "no sources found" and exits 0. An explicit path
 /// (from either `--source` or the profile) that doesn't exist is an
 /// error (spec: exits 1).
+///
+/// Explicit sourcing only (multi-drive-import design D1): `source: auto`
+/// with no CLI override goes through `resolve_sources` instead, which
+/// this function leaves untouched (it still returns the first match
+/// when called directly, but callers no longer call it for that case).
 pub fn resolve_source(
     profile: &Profile,
     cli_source: Option<&Path>,
@@ -478,5 +530,95 @@ mod tests {
             Some(false),
             "scan must always disable GPS lookup, even when the profile enables it"
         );
+    }
+
+    // --- resolve_sources (multi-drive-import design D1, D5, task 1.4) ---
+
+    /// Detects a directory iff its basename is in `matching`.
+    struct NameMatchSource {
+        matching: Vec<&'static str>,
+    }
+
+    impl ImportSource for NameMatchSource {
+        fn detect(&self, root: &Path) -> bool {
+            root.file_name()
+                .map(|n| self.matching.contains(&n.to_str().unwrap()))
+                .unwrap_or(false)
+        }
+        fn scan(
+            &self,
+            _root: &Path,
+            _ctx: &ScanContext,
+        ) -> error::Result<Vec<(MediaGroup, Verdict)>> {
+            Ok(vec![])
+        }
+    }
+
+    #[test]
+    fn resolve_sources_returns_every_matching_subdirectory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("GOPRO01")).unwrap();
+        std::fs::create_dir(dir.path().join("GOPRO02")).unwrap();
+        std::fs::create_dir(dir.path().join("OTHER")).unwrap();
+
+        let source = NameMatchSource {
+            matching: vec!["GOPRO01", "GOPRO02"],
+        };
+        let found = resolve_sources(&source, &[dir.path().to_path_buf()]);
+
+        assert_eq!(
+            found.len(),
+            2,
+            "both matching subdirectories must be returned"
+        );
+        let names: Vec<&str> = found.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"GOPRO01"));
+        assert!(names.contains(&"GOPRO02"));
+    }
+
+    #[test]
+    fn resolve_sources_is_sorted_by_path_regardless_of_read_dir_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Create in reverse-of-sorted order; read_dir order is
+        // unspecified anyway, so this just documents the intent.
+        std::fs::create_dir(dir.path().join("zzz")).unwrap();
+        std::fs::create_dir(dir.path().join("aaa")).unwrap();
+        std::fs::create_dir(dir.path().join("mmm")).unwrap();
+
+        let source = NameMatchSource {
+            matching: vec!["zzz", "aaa", "mmm"],
+        };
+        let found = resolve_sources(&source, &[dir.path().to_path_buf()]);
+
+        let paths: Vec<PathBuf> = found.iter().map(|d| d.path.clone()).collect();
+        let mut sorted = paths.clone();
+        sorted.sort();
+        assert_eq!(paths, sorted, "result must be sorted by path ascending");
+    }
+
+    #[test]
+    fn resolve_sources_excludes_non_matching_subdirectories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("GOPRO01")).unwrap();
+        std::fs::create_dir(dir.path().join("OTHER")).unwrap();
+
+        let source = NameMatchSource {
+            matching: vec!["GOPRO01"],
+        };
+        let found = resolve_sources(&source, &[dir.path().to_path_buf()]);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].name, "GOPRO01");
+    }
+
+    #[test]
+    fn resolve_sources_returns_empty_vec_not_an_error_on_zero_matches() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("OTHER")).unwrap();
+
+        let source = NameMatchSource { matching: vec![] };
+        let found = resolve_sources(&source, &[dir.path().to_path_buf()]);
+
+        assert!(found.is_empty());
     }
 }

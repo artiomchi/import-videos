@@ -19,8 +19,10 @@ use import_videos::config::{LayoutTemplate, Profile, SourceKind, SourceLocation}
 use import_videos::error;
 use import_videos::plan::{self, ImportPlan};
 use import_videos::progress::Progress;
+use import_videos::report;
 use import_videos::source::{ImportSource, MediaFile, MediaGroup, ScanContext, Verdict};
 use import_videos::transfer::{self, TransferOutcome};
+use import_videos::{ImportDriveOutcome, ScanDriveOutcome};
 
 fn ts(secs: i64) -> jiff::Timestamp {
     jiff::Timestamp::from_second(secs).unwrap()
@@ -982,4 +984,720 @@ fn fully_quick_matched_group_is_never_deleted_even_with_delete_source_and_yes() 
         !report.groups[0].deleted_from_source,
         "deleted_from_source must be false for a quick-matched group"
     );
+}
+
+// --- Multi-drive: continue past a failed drive (multi-drive-import, tasks 3.5, 3.6) ---
+
+/// Detects every directory (stands in for `source: auto` matching every
+/// mounted volume) and, per root, either scans canned groups or returns
+/// a hard error — lets a test drive `resolve_sources`/`*_drives` with
+/// per-drive behavior, the same way `TestSource` stands in for real
+/// device detection elsewhere in this file.
+struct MultiDriveSource {
+    behavior: HashMap<PathBuf, DriveBehavior>,
+}
+
+enum DriveBehavior {
+    Groups(Vec<(MediaGroup, Verdict)>),
+    HardError,
+}
+
+impl ImportSource for MultiDriveSource {
+    fn detect(&self, _root: &Path) -> bool {
+        true
+    }
+
+    fn scan(&self, root: &Path, _ctx: &ScanContext) -> error::Result<Vec<(MediaGroup, Verdict)>> {
+        match self.behavior.get(root) {
+            Some(DriveBehavior::Groups(groups)) => Ok(groups.clone()),
+            Some(DriveBehavior::HardError) => Err(error::Error::io(
+                root,
+                std::io::Error::other("simulated malformed metadata"),
+            )),
+            None => Ok(vec![]),
+        }
+    }
+}
+
+fn group_at(name: &str, files: Vec<MediaFile>, timestamp: jiff::Timestamp) -> MediaGroup {
+    MediaGroup {
+        name: name.to_string(),
+        files,
+        timestamp,
+        markers: vec![],
+        geo: None,
+        context: HashMap::new(),
+        sidecar: None,
+    }
+}
+
+#[test]
+fn multi_drive_import_continues_past_a_hard_error_on_one_drive() {
+    // Task 3.5: three fake drives, drive 2's scan step hard-errors —
+    // drive 1 and drive 3 must still produce their normal output and
+    // drive 3's files must actually transfer, with the run's aggregate
+    // reflecting drive 2's failure.
+    let dir = tempfile::tempdir().unwrap();
+    let mount_root = dir.path().join("mount");
+    let drive1 = mount_root.join("drive1");
+    let drive2 = mount_root.join("drive2");
+    let drive3 = mount_root.join("drive3");
+    fs::create_dir_all(&drive1).unwrap();
+    fs::create_dir_all(&drive2).unwrap();
+    fs::create_dir_all(&drive3).unwrap();
+
+    let file1 = drive1.join("a.mp4");
+    let file3 = drive3.join("c.mp4");
+    write_file(&file1, b"drive one footage");
+    write_file(&file3, b"drive three footage");
+
+    let dest = dir.path().join("dest");
+    let prof = profile(&dest, None, false);
+
+    let mut behavior = HashMap::new();
+    behavior.insert(
+        drive1.clone(),
+        DriveBehavior::Groups(vec![(group("a", vec![media_file(&file1)]), Verdict::Keep)]),
+    );
+    behavior.insert(drive2.clone(), DriveBehavior::HardError);
+    behavior.insert(
+        drive3.clone(),
+        DriveBehavior::Groups(vec![(group("c", vec![media_file(&file3)]), Verdict::Keep)]),
+    );
+    let source_impl = MultiDriveSource { behavior };
+
+    let drives = plan::resolve_sources(&source_impl, std::slice::from_ref(&mount_root));
+    assert_eq!(drives.len(), 3, "all three drives must be detected");
+
+    let results = import_videos::import_drives(
+        &prof,
+        &source_impl,
+        &drives,
+        false, // dry_run
+        true,  // assume_yes
+        false, // quick_match
+        &jiff::tz::TimeZone::UTC,
+        false, // verbose
+        false, // json
+    );
+
+    assert_eq!(results.len(), 3);
+    assert!(
+        matches!(
+            results[0].result,
+            Ok(ImportDriveOutcome::Executed {
+                any_failed: false,
+                ..
+            })
+        ),
+        "drive 1 must complete normally: {:?}",
+        results[0].result
+    );
+    assert!(
+        results[1].result.is_err(),
+        "drive 2's hard error must be caught, not propagated"
+    );
+    assert!(
+        matches!(
+            results[2].result,
+            Ok(ImportDriveOutcome::Executed {
+                any_failed: false,
+                ..
+            })
+        ),
+        "drive 3 must still run after drive 2 failed: {:?}",
+        results[2].result
+    );
+
+    assert_eq!(
+        fs::read(dest.join("1970/1970-01-01/c.mp4")).unwrap(),
+        b"drive three footage",
+        "drive 3's file must have actually transferred despite drive 2's failure"
+    );
+
+    assert!(
+        import_videos::any_import_drive_failed(&results),
+        "the run's aggregate must reflect drive 2's failure (process exits 1)"
+    );
+}
+
+#[test]
+fn multi_drive_import_continues_past_a_transfer_failure_on_one_drive() {
+    // Task 3.6: drive 2 has one file that fails verification (same
+    // permission-based injection as
+    // transfer_failure_keeps_source_and_does_not_block_other_groups)
+    // while drives 1 and 3 succeed — all three drives' reports must
+    // exist and the run's aggregate must reflect drive 2's failure.
+    let dir = tempfile::tempdir().unwrap();
+    let mount_root = dir.path().join("mount");
+    let drive1 = mount_root.join("drive1");
+    let drive2 = mount_root.join("drive2");
+    let drive3 = mount_root.join("drive3");
+    fs::create_dir_all(&drive1).unwrap();
+    fs::create_dir_all(&drive2).unwrap();
+    fs::create_dir_all(&drive3).unwrap();
+
+    let file1 = drive1.join("a.mp4");
+    let file2 = drive2.join("b.mp4");
+    let file3 = drive3.join("c.mp4");
+    write_file(&file1, b"drive one footage");
+    write_file(&file2, b"drive two footage");
+    write_file(&file3, b"drive three footage");
+
+    let dest = dir.path().join("dest");
+    let prof = profile(&dest, None, false);
+
+    // Distinct dates so each drive resolves to its own destination
+    // directory — only drive 2's must be made unwritable.
+    let ts1 = ts(0);
+    let ts2 = ts(200_000);
+    let ts3 = ts(400_000);
+
+    let dest2_relative = prof
+        .layout
+        .resolve(&HashMap::new(), ts2, &jiff::tz::TimeZone::UTC)
+        .unwrap();
+    let dest2_dir = dest.join(dest2_relative);
+    fs::create_dir_all(&dest2_dir).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dest2_dir, fs::Permissions::from_mode(0o500)).unwrap();
+    }
+
+    let mut behavior = HashMap::new();
+    behavior.insert(
+        drive1.clone(),
+        DriveBehavior::Groups(vec![(
+            group_at("a", vec![media_file(&file1)], ts1),
+            Verdict::Keep,
+        )]),
+    );
+    behavior.insert(
+        drive2.clone(),
+        DriveBehavior::Groups(vec![(
+            group_at("b", vec![media_file(&file2)], ts2),
+            Verdict::Keep,
+        )]),
+    );
+    behavior.insert(
+        drive3.clone(),
+        DriveBehavior::Groups(vec![(
+            group_at("c", vec![media_file(&file3)], ts3),
+            Verdict::Keep,
+        )]),
+    );
+    let source_impl = MultiDriveSource { behavior };
+
+    let drives = plan::resolve_sources(&source_impl, std::slice::from_ref(&mount_root));
+    assert_eq!(drives.len(), 3);
+
+    let results = import_videos::import_drives(
+        &prof,
+        &source_impl,
+        &drives,
+        false,
+        true,
+        false,
+        &jiff::tz::TimeZone::UTC,
+        false,
+        false,
+    );
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&dest2_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    assert_eq!(results.len(), 3);
+    assert!(
+        matches!(
+            results[0].result,
+            Ok(ImportDriveOutcome::Executed {
+                any_failed: false,
+                ..
+            })
+        ),
+        "drive 1 must complete normally: {:?}",
+        results[0].result
+    );
+    assert!(
+        matches!(
+            results[2].result,
+            Ok(ImportDriveOutcome::Executed {
+                any_failed: false,
+                ..
+            })
+        ),
+        "drive 3 must complete normally: {:?}",
+        results[2].result
+    );
+
+    match &results[1].result {
+        Ok(ImportDriveOutcome::Executed { report, any_failed }) => {
+            assert!(*any_failed, "drive 2 must record its transfer failure");
+            assert!(matches!(
+                report.groups[0].files[0].outcome,
+                TransferOutcome::Failed(_)
+            ));
+        }
+        other => {
+            panic!("drive 2 should still execute (soft failure, not a hard error), got {other:?}")
+        }
+    }
+    assert!(
+        file2.exists(),
+        "drive 2's source must remain after its failed transfer"
+    );
+
+    assert!(
+        import_videos::any_import_drive_failed(&results),
+        "the run's aggregate must reflect drive 2's transfer failure (process exits 1)"
+    );
+}
+
+#[test]
+fn multi_drive_scan_continues_past_a_hard_error_on_one_drive() {
+    // Verification follow-up: scan_drives (the multi-drive `scan` path)
+    // had no automated coverage — only import_drives did. Mirrors the
+    // import-side hard-error test above, but through scan_drives.
+    let dir = tempfile::tempdir().unwrap();
+    let mount_root = dir.path().join("mount");
+    let drive1 = mount_root.join("drive1");
+    let drive2 = mount_root.join("drive2");
+    let drive3 = mount_root.join("drive3");
+    fs::create_dir_all(&drive1).unwrap();
+    fs::create_dir_all(&drive2).unwrap();
+    fs::create_dir_all(&drive3).unwrap();
+
+    let file1 = drive1.join("a.mp4");
+    let file3 = drive3.join("c.mp4");
+    write_file(&file1, b"drive one footage");
+    write_file(&file3, b"drive three footage");
+
+    let dest = dir.path().join("dest");
+    let prof = profile(&dest, None, false);
+
+    let mut behavior = HashMap::new();
+    behavior.insert(
+        drive1.clone(),
+        DriveBehavior::Groups(vec![(group("a", vec![media_file(&file1)]), Verdict::Keep)]),
+    );
+    behavior.insert(drive2.clone(), DriveBehavior::HardError);
+    behavior.insert(
+        drive3.clone(),
+        DriveBehavior::Groups(vec![(group("c", vec![media_file(&file3)]), Verdict::Keep)]),
+    );
+    let source_impl = MultiDriveSource { behavior };
+
+    let drives = plan::resolve_sources(&source_impl, std::slice::from_ref(&mount_root));
+    assert_eq!(drives.len(), 3, "all three drives must be detected");
+
+    let results = import_videos::scan_drives(
+        &prof,
+        &source_impl,
+        &drives,
+        &jiff::tz::TimeZone::UTC,
+        false, // verbose
+        false, // json
+    );
+
+    assert_eq!(results.len(), 3);
+    assert!(
+        matches!(results[0].result, Ok(ScanDriveOutcome::Found(_))),
+        "drive 1 must scan normally: {:?}",
+        results[0].result
+    );
+    assert!(
+        results[1].result.is_err(),
+        "drive 2's hard scan error must be caught, not propagated"
+    );
+    assert!(
+        matches!(results[2].result, Ok(ScanDriveOutcome::Found(_))),
+        "drive 3 must still scan after drive 2 failed: {:?}",
+        results[2].result
+    );
+
+    let any_error = results.iter().any(|r| r.result.is_err());
+    assert!(
+        any_error,
+        "the run's aggregate must reflect drive 2's failure (scan process would exit 1)"
+    );
+}
+
+#[test]
+fn multi_drive_empty_drive_is_reported_distinctly_and_does_not_affect_others() {
+    // Verification follow-up: "A detected drive with nothing to import
+    // is reported distinctly" had no automated coverage. Drive 2 is
+    // detected (MultiDriveSource always detects) but scans to zero
+    // groups; drives 1 and 3 have real media. Checked through both
+    // scan_drives and import_drives, since the Empty outcome and the
+    // "does not affect other drives / does not count as a failure"
+    // guarantee apply to both commands identically (design D3, D6).
+    let dir = tempfile::tempdir().unwrap();
+    let mount_root = dir.path().join("mount");
+    let drive1 = mount_root.join("drive1");
+    let drive2 = mount_root.join("drive2");
+    let drive3 = mount_root.join("drive3");
+    fs::create_dir_all(&drive1).unwrap();
+    fs::create_dir_all(&drive2).unwrap();
+    fs::create_dir_all(&drive3).unwrap();
+
+    let file1 = drive1.join("a.mp4");
+    let file3 = drive3.join("c.mp4");
+    write_file(&file1, b"drive one footage");
+    write_file(&file3, b"drive three footage");
+
+    let dest = dir.path().join("dest");
+    let prof = profile(&dest, None, false);
+
+    let mut behavior = HashMap::new();
+    behavior.insert(
+        drive1.clone(),
+        DriveBehavior::Groups(vec![(group("a", vec![media_file(&file1)]), Verdict::Keep)]),
+    );
+    behavior.insert(drive2.clone(), DriveBehavior::Groups(vec![])); // detected, nothing to import
+    behavior.insert(
+        drive3.clone(),
+        DriveBehavior::Groups(vec![(group("c", vec![media_file(&file3)]), Verdict::Keep)]),
+    );
+    let source_impl = MultiDriveSource { behavior };
+
+    let drives = plan::resolve_sources(&source_impl, std::slice::from_ref(&mount_root));
+    assert_eq!(
+        drives.len(),
+        3,
+        "the empty drive is still detected, not dropped"
+    );
+
+    // --- scan ---
+    let scan_results = import_videos::scan_drives(
+        &prof,
+        &source_impl,
+        &drives,
+        &jiff::tz::TimeZone::UTC,
+        false,
+        false,
+    );
+    assert!(matches!(
+        scan_results[0].result,
+        Ok(ScanDriveOutcome::Found(_))
+    ));
+    assert!(
+        matches!(scan_results[1].result, Ok(ScanDriveOutcome::Empty)),
+        "drive 2 must be reported as empty, not an error and not skipped: {:?}",
+        scan_results[1].result
+    );
+    assert!(matches!(
+        scan_results[2].result,
+        Ok(ScanDriveOutcome::Found(_))
+    ));
+    assert!(
+        !scan_results.iter().any(|r| r.result.is_err()),
+        "an empty drive must never be recorded as a failure"
+    );
+
+    // --- import ---
+    let import_results = import_videos::import_drives(
+        &prof,
+        &source_impl,
+        &drives,
+        false,
+        true,
+        false,
+        &jiff::tz::TimeZone::UTC,
+        false,
+        false,
+    );
+    assert!(matches!(
+        import_results[0].result,
+        Ok(ImportDriveOutcome::Executed {
+            any_failed: false,
+            ..
+        })
+    ));
+    assert!(
+        matches!(import_results[1].result, Ok(ImportDriveOutcome::Empty)),
+        "drive 2 must be reported as empty, not an error and not skipped: {:?}",
+        import_results[1].result
+    );
+    assert!(matches!(
+        import_results[2].result,
+        Ok(ImportDriveOutcome::Executed {
+            any_failed: false,
+            ..
+        })
+    ));
+    assert!(
+        !import_videos::any_import_drive_failed(&import_results),
+        "an empty drive must never count toward the run's failure aggregate"
+    );
+
+    // Drives 1 and 3 actually transferred, unaffected by drive 2 being empty.
+    assert_eq!(
+        fs::read(dest.join("1970/1970-01-01/a.mp4")).unwrap(),
+        b"drive one footage"
+    );
+    assert_eq!(
+        fs::read(dest.join("1970/1970-01-01/c.mp4")).unwrap(),
+        b"drive three footage"
+    );
+}
+
+#[test]
+fn multi_drive_import_prompts_independently_per_drive_when_non_interactive() {
+    // Verification follow-up: "Each drive in a multi-drive run prompts
+    // independently" / "--yes skips every drive's prompt" had no
+    // automated coverage — both earlier multi-drive tests use
+    // delete_source: false, so neither ever reaches transfer::execute's
+    // confirm() gate. Here delete_source: true and assume_yes: false;
+    // the test process's stdin is not a terminal (confirmed via a
+    // dedicated probe against this same harness), so each drive
+    // independently hits the "non-interactive, no --yes" skip path
+    // rather than being asked to confirm or assumed confirmed.
+    let dir = tempfile::tempdir().unwrap();
+    let mount_root = dir.path().join("mount");
+    let drive1 = mount_root.join("drive1");
+    let drive2 = mount_root.join("drive2");
+    fs::create_dir_all(&drive1).unwrap();
+    fs::create_dir_all(&drive2).unwrap();
+
+    let file1 = drive1.join("a.mp4");
+    let file2 = drive2.join("b.mp4");
+    write_file(&file1, b"drive one footage");
+    write_file(&file2, b"drive two footage");
+
+    let dest = dir.path().join("dest");
+    let prof = profile(&dest, None, true); // delete_source: true
+
+    let ts1 = ts(0);
+    let ts2 = ts(200_000);
+
+    let mut behavior = HashMap::new();
+    behavior.insert(
+        drive1.clone(),
+        DriveBehavior::Groups(vec![(
+            group_at("a", vec![media_file(&file1)], ts1),
+            Verdict::Keep,
+        )]),
+    );
+    behavior.insert(
+        drive2.clone(),
+        DriveBehavior::Groups(vec![(
+            group_at("b", vec![media_file(&file2)], ts2),
+            Verdict::Keep,
+        )]),
+    );
+    let source_impl = MultiDriveSource { behavior };
+
+    let drives = plan::resolve_sources(&source_impl, std::slice::from_ref(&mount_root));
+    assert_eq!(drives.len(), 2);
+
+    // assume_yes: false — each drive's deletion gate depends solely on
+    // its own confirm() call, never on any other drive's outcome.
+    let results = import_videos::import_drives(
+        &prof,
+        &source_impl,
+        &drives,
+        false,
+        false,
+        false,
+        &jiff::tz::TimeZone::UTC,
+        false,
+        false,
+    );
+
+    assert_eq!(results.len(), 2);
+    for (i, r) in results.iter().enumerate() {
+        match &r.result {
+            Ok(ImportDriveOutcome::Executed { report, .. }) => {
+                assert!(
+                    report.deletion_skipped_reason.is_some(),
+                    "drive {i}'s deletion must be independently skipped (non-interactive, no --yes): {:?}",
+                    report.deletion_skipped_reason
+                );
+                assert!(
+                    !report.groups[0].deleted_from_source,
+                    "drive {i}'s source must not be deleted without confirmation"
+                );
+            }
+            other => panic!(
+                "drive {i} must execute (transfer succeeds; only deletion is gated): {other:?}"
+            ),
+        }
+    }
+
+    // Both files transferred (deletion is what's gated, not the copy)
+    // and both sources remain, each drive's own skip independent of
+    // the other's.
+    let dest1_relative = prof
+        .layout
+        .resolve(&HashMap::new(), ts1, &jiff::tz::TimeZone::UTC)
+        .unwrap();
+    let dest2_relative = prof
+        .layout
+        .resolve(&HashMap::new(), ts2, &jiff::tz::TimeZone::UTC)
+        .unwrap();
+    assert_eq!(
+        fs::read(dest.join(dest1_relative).join("a.mp4")).unwrap(),
+        b"drive one footage"
+    );
+    assert_eq!(
+        fs::read(dest.join(dest2_relative).join("b.mp4")).unwrap(),
+        b"drive two footage"
+    );
+    assert!(file1.exists(), "drive 1's source must remain");
+    assert!(file2.exists(), "drive 2's source must remain");
+}
+
+// --- Multi-drive JSON shape (multi-drive-import design D4, task 4.5) ---
+
+#[test]
+fn scan_drive_json_lists_every_drive_with_correct_shape() {
+    let tz = jiff::tz::TimeZone::UTC;
+    let summary = plan::ScanSummary {
+        entries: vec![plan::ScanEntry {
+            name: "session".to_string(),
+            verdict: Verdict::Keep,
+            file_count: 1,
+            total_size: 10,
+            recorded_at: ts(0),
+            files: vec!["/drive/session/clip.mp4".to_string()],
+        }],
+    };
+    let ok_result: error::Result<ScanDriveOutcome> = Ok(ScanDriveOutcome::Found(summary));
+    let err_result: error::Result<ScanDriveOutcome> = Err(error::Error::Config("boom".to_string()));
+
+    let doc = report::MultiScanJson {
+        drives: vec![
+            report::scan_drive_json("DRIVE1", Path::new("/mnt/DRIVE1"), &ok_result, &tz),
+            report::scan_drive_json("DRIVE2", Path::new("/mnt/DRIVE2"), &err_result, &tz),
+        ],
+    };
+    let value = serde_json::to_value(&doc).unwrap();
+    let drives = value["drives"].as_array().unwrap();
+    assert_eq!(
+        drives.len(),
+        2,
+        "drives array must have one entry per drive"
+    );
+
+    assert_eq!(drives[0]["name"], "DRIVE1");
+    assert_eq!(drives[0]["path"], "/mnt/DRIVE1");
+    assert_eq!(drives[0]["status"], "completed");
+    assert!(drives[0]["summary"].is_object());
+    assert!(
+        drives[0].get("error").is_none(),
+        "a completed drive's entry must carry no error key"
+    );
+
+    assert_eq!(drives[1]["name"], "DRIVE2");
+    assert_eq!(drives[1]["status"], "error");
+    assert!(drives[1]["error"].as_str().unwrap().contains("boom"));
+    assert!(
+        drives[1].get("summary").is_none(),
+        "an error-status drive's entry must carry no summary key"
+    );
+}
+
+#[test]
+fn import_multi_drive_any_failed_is_true_only_when_a_drive_failed() {
+    let ok_report = transfer::ExecuteReport {
+        groups: vec![],
+        deletion_skipped_reason: None,
+        delete_source: false,
+    };
+
+    let all_succeeded = vec![
+        import_videos::DriveResult {
+            name: "d1".to_string(),
+            path: PathBuf::from("/mnt/d1"),
+            result: Ok(ImportDriveOutcome::Executed {
+                report: ok_report.clone(),
+                any_failed: false,
+            }),
+        },
+        import_videos::DriveResult {
+            name: "d2".to_string(),
+            path: PathBuf::from("/mnt/d2"),
+            result: Ok(ImportDriveOutcome::Executed {
+                report: ok_report.clone(),
+                any_failed: false,
+            }),
+        },
+    ];
+    assert!(
+        !import_videos::any_import_drive_failed(&all_succeeded),
+        "any_failed must be false when every drive succeeded"
+    );
+
+    let one_failed = vec![
+        import_videos::DriveResult {
+            name: "d1".to_string(),
+            path: PathBuf::from("/mnt/d1"),
+            result: Ok(ImportDriveOutcome::Executed {
+                report: ok_report.clone(),
+                any_failed: false,
+            }),
+        },
+        import_videos::DriveResult {
+            name: "d2".to_string(),
+            path: PathBuf::from("/mnt/d2"),
+            result: Err(error::Error::Config("boom".to_string())),
+        },
+    ];
+    assert!(
+        import_videos::any_import_drive_failed(&one_failed),
+        "any_failed must be true when any drive failed"
+    );
+}
+
+// --- Explicit-source JSON stays byte-for-byte unchanged (task 4.4) ---
+
+#[test]
+fn explicit_source_scan_json_has_no_drives_key_and_keeps_flat_shape() {
+    let dir = tempfile::tempdir().unwrap();
+    let source_dir = dir.path().join("card");
+    write_file(
+        &source_dir.join("DCIM/100GOPRO/GX010001.MP4"),
+        b"not an mp4 at all",
+    );
+    let dest = dir.path().join("dest");
+    let config_path = dir.path().join("config.yaml");
+    write_config(
+        &config_path,
+        &format!(
+            "profiles:\n  cam:\n    type: gopro\n    require_marker: false\n    source: auto\n    destination: {}\n    layout: \"{{date:%Y}}/{{date:%Y-%m-%d}}\"\n",
+            dest.display()
+        ),
+    );
+
+    let output = bin()
+        .args([
+            "--config",
+            config_path.to_str().unwrap(),
+            "--json",
+            "scan",
+            "cam",
+            "--source",
+            source_dir.to_str().unwrap(),
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let value: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    assert!(
+        value.get("drives").is_none(),
+        "explicit-source JSON must not carry a drives key"
+    );
+    assert!(
+        value.get("entries").is_some(),
+        "explicit-source scan JSON keeps its flat entries/summary shape"
+    );
+    assert!(value.get("summary").is_some());
 }

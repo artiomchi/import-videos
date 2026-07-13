@@ -15,12 +15,13 @@ pub mod source;
 pub mod transfer;
 
 use std::io::IsTerminal;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
 use cli::{Cli, Command};
 use error::{Error, ExitCode, Result};
+use source::ImportSource;
 
 /// Parses arguments, runs the requested command, and returns the
 /// process exit code (design D7: 0 success, 1 failure, 2 usage/config
@@ -204,46 +205,322 @@ fn apply_overrides(
     Ok(profile)
 }
 
-/// Resolves a source and builds a plan for the already-resolved
-/// `profile` (overrides applied — task 2.4, plan/transfer/report stay
-/// override-unaware), handling the "nothing to do" case. Used only by
-/// `run_import` now (`run_scan` builds its own source-only inventory
-/// via `build_scan_summary` — design D1). `scan_progress` reports the
-/// scan phase's progress (add-scan-progress design D1, D4) — its
-/// enabled/hidden state is decided once by the caller, never re-derived
-/// here. `Ok(None)` means the caller should report "nothing found" and
-/// stop. Returns the resolved source root alongside the plan (design
-/// D6) so the caller can pass it to `transfer::execute` as the
-/// directory-pruning boundary.
-fn scan_profile(
-    cfg: &config::Config,
+/// A profile's source is either an explicit single path (CLI `--source`
+/// override or a profile's own `source: <path>`) or zero-or-more
+/// auto-detected drives (`source: auto`) — multi-drive-import design D1.
+/// Explicit sourcing reuses `plan::resolve_source` untouched (task 1.3);
+/// only the auto branch goes through the new `plan::resolve_sources`.
+enum EffectiveSources {
+    Explicit(PathBuf),
+    Multi(Vec<plan::DetectedSource>),
+}
+
+/// Decides which of the two source-resolution paths a run takes,
+/// without duplicating `resolve_source`'s explicit-path logic (design
+/// D1). `resolve_source`'s explicit branch either resolves to `Some` or
+/// returns `Err` — it only ever returns `Ok(None)` from its mount-roots
+/// loop, which this function never reaches for the explicit case, so
+/// the `expect` below cannot fail.
+fn resolve_effective_sources(
     profile: &config::Profile,
-    source_override: Option<&Path>,
-    scan_progress: &progress::Progress,
-) -> Result<Option<(std::path::PathBuf, plan::ImportPlan)>> {
-    let source_impl = profile.kind.build();
-
-    let Some(root) = plan::resolve_source(
-        profile,
-        source_override,
-        source_impl.as_ref(),
-        &cfg.mount_roots,
-    )?
-    else {
-        return Ok(None);
-    };
-
-    let import_plan = plan::build_plan(
-        profile,
-        source_impl.as_ref(),
-        &root,
-        &cfg.timezone,
-        scan_progress,
-    )?;
-    if import_plan.actions.is_empty() {
-        return Ok(None);
+    cli_source: Option<&Path>,
+    source_impl: &dyn ImportSource,
+    mount_roots: &[std::path::PathBuf],
+) -> Result<EffectiveSources> {
+    let explicit =
+        cli_source.is_some() || matches!(profile.source, config::SourceLocation::Path(_));
+    if explicit {
+        let root = plan::resolve_source(profile, cli_source, source_impl, mount_roots)?
+            .expect("explicit source resolution always yields Some or Err");
+        Ok(EffectiveSources::Explicit(root))
+    } else {
+        Ok(EffectiveSources::Multi(plan::resolve_sources(
+            source_impl,
+            mount_roots,
+        )))
     }
-    Ok(Some((root, import_plan)))
+}
+
+/// One detected drive's outcome after `run_scan_cycle` (multi-drive-import
+/// design D3): distinct from a hard error, which is carried in the
+/// `Result`'s `Err` side instead (so error-classification for exit codes
+/// is never lost by converting it early — see `run_import_cycle`).
+#[derive(Debug)]
+pub enum ScanDriveOutcome {
+    /// The drive was detected but its scan produced zero groups (spec:
+    /// "A detected drive with nothing to import is reported distinctly").
+    Empty,
+    Found(plan::ScanSummary),
+}
+
+/// Mirrors `ScanDriveOutcome` for `import` (design D3). `Executed`'s
+/// `any_failed` is the same per-file/sidecar failure check `run_import`
+/// already performed for a single drive, now scoped to one drive in a
+/// multi-drive batch.
+#[derive(Debug)]
+pub enum ImportDriveOutcome {
+    Empty,
+    /// `--dry-run`: plan built and printed, nothing executed.
+    Planned(plan::ImportPlan),
+    Executed {
+        report: transfer::ExecuteReport,
+        any_failed: bool,
+    },
+}
+
+impl ImportDriveOutcome {
+    /// Whether this drive's own outcome should count toward the run's
+    /// aggregate failure (design D3): only an executed drive with at
+    /// least one failed file/sidecar counts — `Empty` and `Planned`
+    /// (dry-run) never do, since nothing was executed to fail.
+    fn is_failure(&self) -> bool {
+        matches!(
+            self,
+            ImportDriveOutcome::Executed {
+                any_failed: true,
+                ..
+            }
+        )
+    }
+}
+
+/// One drive's identity (design: "Each drive is identified by name and
+/// path") paired with the `Result` of running its cycle — `Err` for a
+/// hard error caught at this drive rather than propagated (spec: "A
+/// hard error on one drive is caught, not propagated").
+#[derive(Debug)]
+pub struct DriveResult<T> {
+    pub name: String,
+    pub path: PathBuf,
+    pub result: Result<T>,
+}
+
+/// The run's aggregate exit-code input (design D7): `Failure` if any
+/// drive recorded a hard error or a failed transfer, `Success`
+/// otherwise — the same rule `run_import` already applied to a single
+/// drive's report, folded across every drive in the batch.
+pub fn any_import_drive_failed(results: &[DriveResult<ImportDriveOutcome>]) -> bool {
+    results.iter().any(|r| match &r.result {
+        Err(_) => true,
+        Ok(outcome) => outcome.is_failure(),
+    })
+}
+
+/// Prints a drive's name and full path before anything else about it
+/// (spec: "Each drive is identified by name and path before its
+/// output") — the one line every per-drive human-mode branch (found,
+/// empty, error) is printed after.
+fn print_drive_header(name: &str, path: &Path) {
+    println!("== {name} ({}) ==", path.display());
+}
+
+/// Same `any_failed` check `run_import` has always applied to a single
+/// drive's `ExecuteReport` (design D3), factored out so the multi-drive
+/// loop can apply it per drive without duplicating the closure.
+fn report_any_failed(report: &transfer::ExecuteReport) -> bool {
+    report.groups.iter().any(|g| {
+        g.files
+            .iter()
+            .any(|f| matches!(f.outcome, transfer::TransferOutcome::Failed(_)))
+            || matches!(
+                g.sidecar_outcome,
+                Some(transfer::TransferOutcome::Failed(_))
+            )
+    })
+}
+
+/// The scan phase for one already-resolved source root — shared by the
+/// explicit-source call site and the auto multi-drive loop (design D1's
+/// shared-logic mitigation). Prints nothing for an `Empty` result: the
+/// two callers render "nothing found" differently (explicit: "no
+/// sources found"; multi-drive: a per-drive "no media found" line), so
+/// that decision stays with them. A hard error propagates via `?`
+/// (never caught here) so the explicit-source caller keeps today's
+/// exact exit-code classification (design D3's per-drive catching only
+/// happens in the multi-drive loop, one layer up).
+fn run_scan_cycle(
+    profile: &config::Profile,
+    source_impl: &dyn ImportSource,
+    source_root: &Path,
+    tz: &jiff::tz::TimeZone,
+    verbose: bool,
+    json: bool,
+) -> Result<ScanDriveOutcome> {
+    let scan_progress = progress::Progress::counted(scan_progress_enabled(json), "Scanning");
+    let summary = plan::build_scan_summary(profile, source_impl, source_root, tz, &scan_progress)?;
+
+    if summary.entries.is_empty() {
+        return Ok(ScanDriveOutcome::Empty);
+    }
+    if !json {
+        print_scan_summary(&summary, verbose, tz, json);
+    }
+    Ok(ScanDriveOutcome::Found(summary))
+}
+
+/// The scan → build plan → print plan → confirm → execute → print
+/// report cycle for one already-resolved source root (design D1's
+/// shared-logic mitigation, task 2.1): called once for explicit
+/// sourcing (today's exact output, task 2.5) and once per drive in the
+/// auto multi-drive loop. JSON printing is never done here — callers
+/// print it themselves, immediately for explicit sourcing (single
+/// document) or once after every drive has run for the multi-drive
+/// loop (one combined document, design D4) — so this function only
+/// ever prints in human mode. A hard error propagates via `?`, exactly
+/// like `run_scan_cycle` above.
+#[allow(clippy::too_many_arguments)]
+fn run_import_cycle(
+    profile: &config::Profile,
+    source_impl: &dyn ImportSource,
+    source_root: &Path,
+    dry_run: bool,
+    assume_yes: bool,
+    quick_match: bool,
+    tz: &jiff::tz::TimeZone,
+    verbose: bool,
+    json: bool,
+) -> Result<ImportDriveOutcome> {
+    let scan_progress = progress::Progress::counted(scan_progress_enabled(json), "Scanning");
+    let import_plan = plan::build_plan(profile, source_impl, source_root, tz, &scan_progress)?;
+
+    if import_plan.actions.is_empty() {
+        return Ok(ImportDriveOutcome::Empty);
+    }
+
+    if dry_run {
+        if !json {
+            print_plan(&import_plan, verbose, tz, json);
+        }
+        return Ok(ImportDriveOutcome::Planned(import_plan));
+    }
+
+    // A non-dry-run, human-mode import states its intent before
+    // transferring anything (improve-console-output design D4): the
+    // same plan `scan` would print.
+    if !json {
+        print_plan(&import_plan, verbose, tz, json);
+    }
+
+    // A separate, byte-oriented Progress for the transfer phase (design
+    // D6), built after scanning completes.
+    let progress = progress::Progress::new(scan_progress_enabled(json), "Importing");
+
+    let exec_report = transfer::execute(
+        &import_plan,
+        source_root,
+        profile.delete_source,
+        assume_yes,
+        quick_match,
+        profile.reflink,
+        &progress,
+    )?;
+
+    if !json {
+        print!("{}", report::render_results(&exec_report, verbose));
+    }
+
+    let any_failed = report_any_failed(&exec_report);
+    Ok(ImportDriveOutcome::Executed {
+        report: exec_report,
+        any_failed,
+    })
+}
+
+/// Runs `scan`'s cycle once per detected drive (multi-drive-import
+/// design D2), printing each drive's header first (human mode only —
+/// JSON callers assemble their document from the returned results
+/// instead) and catching a hard error at that drive rather than
+/// propagating it (spec: "A hard error on one drive is caught, not
+/// propagated").
+pub fn scan_drives(
+    profile: &config::Profile,
+    source_impl: &dyn ImportSource,
+    drives: &[plan::DetectedSource],
+    tz: &jiff::tz::TimeZone,
+    verbose: bool,
+    json: bool,
+) -> Vec<DriveResult<ScanDriveOutcome>> {
+    drives
+        .iter()
+        .map(|drive| {
+            if !json {
+                print_drive_header(&drive.name, &drive.path);
+            }
+            let result = run_scan_cycle(profile, source_impl, &drive.path, tz, verbose, json);
+            if !json {
+                match &result {
+                    Ok(ScanDriveOutcome::Empty) => {
+                        print!(
+                            "{}",
+                            report::render_scan_summary(&plan::ScanSummary::default(), verbose, tz)
+                        );
+                    }
+                    Ok(ScanDriveOutcome::Found(_)) => {}
+                    Err(e) => println!("error: {e}"),
+                }
+            }
+            DriveResult {
+                name: drive.name.clone(),
+                path: drive.path.clone(),
+                result,
+            }
+        })
+        .collect()
+}
+
+/// Runs `import`'s cycle once per detected drive, sequentially —
+/// completing one drive's cycle (report printed) before the next
+/// starts (spec: "Import processes drives sequentially with
+/// independent confirmation") — with the same per-drive header and
+/// error-catching as `scan_drives`.
+#[allow(clippy::too_many_arguments)]
+pub fn import_drives(
+    profile: &config::Profile,
+    source_impl: &dyn ImportSource,
+    drives: &[plan::DetectedSource],
+    dry_run: bool,
+    assume_yes: bool,
+    quick_match: bool,
+    tz: &jiff::tz::TimeZone,
+    verbose: bool,
+    json: bool,
+) -> Vec<DriveResult<ImportDriveOutcome>> {
+    drives
+        .iter()
+        .map(|drive| {
+            if !json {
+                print_drive_header(&drive.name, &drive.path);
+            }
+            let result = run_import_cycle(
+                profile,
+                source_impl,
+                &drive.path,
+                dry_run,
+                assume_yes,
+                quick_match,
+                tz,
+                verbose,
+                json,
+            );
+            if !json {
+                match &result {
+                    Ok(ImportDriveOutcome::Empty) => {
+                        print!(
+                            "{}",
+                            report::render_plan(&plan::ImportPlan::default(), verbose, tz)
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => println!("error: {e}"),
+                }
+            }
+            DriveResult {
+                name: drive.name.clone(),
+                path: drive.path.clone(),
+                result,
+            }
+        })
+        .collect()
 }
 
 /// Prints "no sources found" as a bare string, or — under `--json` — as
@@ -296,11 +573,13 @@ fn scan_progress_enabled(json: bool) -> bool {
     std::io::stdout().is_terminal() && !json
 }
 
-/// `scan` diverges from `import`/`--dry-run` (design D1, D7): it builds
-/// a source-only inventory via `build_scan_summary` instead of sharing
-/// `scan_profile`/`build_plan` — it never resolves a destination or
-/// quarantine path and never performs GPS lookup, so there is no
-/// `ImportPlan` to reuse here.
+/// Dispatches on `EffectiveSources` (multi-drive-import design D1):
+/// explicit sourcing runs `run_scan_cycle` once with today's exact
+/// output; `source: auto` runs it once per detected drive via
+/// `scan_drives`, printing each drive's header first and assembling one
+/// combined JSON document afterward (design D4) rather than one per
+/// drive. Zero detected drives reports "no sources found" exactly like
+/// a single-source run (spec: "Zero matching drives").
 fn run_scan(
     cfg: &config::Config,
     profile_name: &str,
@@ -312,34 +591,67 @@ fn run_scan(
     let profile = resolve_profile(cfg, profile_name, overrides)?;
     let source_impl = profile.kind.build();
 
-    let Some(root) = plan::resolve_source(
+    match resolve_effective_sources(
         &profile,
         source_override,
         source_impl.as_ref(),
         &cfg.mount_roots,
-    )?
-    else {
-        print_no_sources(profile_name, json);
-        return Ok(ExitCode::Success);
-    };
-
-    let scan_progress = progress::Progress::counted(scan_progress_enabled(json), "Scanning");
-    let summary = plan::build_scan_summary(
-        &profile,
-        source_impl.as_ref(),
-        &root,
-        &cfg.timezone,
-        &scan_progress,
-    )?;
-
-    if summary.entries.is_empty() {
-        print_no_sources(profile_name, json);
-    } else {
-        print_scan_summary(&summary, verbose, &cfg.timezone, json);
+    )? {
+        EffectiveSources::Explicit(root) => {
+            match run_scan_cycle(
+                &profile,
+                source_impl.as_ref(),
+                &root,
+                &cfg.timezone,
+                verbose,
+                json,
+            )? {
+                ScanDriveOutcome::Empty => print_no_sources(profile_name, json),
+                ScanDriveOutcome::Found(summary) => {
+                    if json {
+                        print_json(&report::scan_summary_to_json(&summary, &cfg.timezone));
+                    }
+                }
+            }
+            Ok(ExitCode::Success)
+        }
+        EffectiveSources::Multi(drives) => {
+            if drives.is_empty() {
+                print_no_sources(profile_name, json);
+                return Ok(ExitCode::Success);
+            }
+            let results = scan_drives(
+                &profile,
+                source_impl.as_ref(),
+                &drives,
+                &cfg.timezone,
+                verbose,
+                json,
+            );
+            let any_error = results.iter().any(|r| r.result.is_err());
+            if json {
+                let json_drives = results
+                    .iter()
+                    .map(|r| report::scan_drive_json(&r.name, &r.path, &r.result, &cfg.timezone))
+                    .collect();
+                print_json(&report::MultiScanJson {
+                    drives: json_drives,
+                });
+            }
+            Ok(if any_error {
+                ExitCode::Failure
+            } else {
+                ExitCode::Success
+            })
+        }
     }
-    Ok(ExitCode::Success)
 }
 
+/// Mirrors `run_scan`'s dispatch for `import` (multi-drive-import
+/// design D1-D3): explicit sourcing runs `run_import_cycle` once,
+/// unchanged from before this change (task 2.5); `source: auto` runs it
+/// once per detected drive sequentially via `import_drives`, aggregating
+/// each drive's failure into the run's overall exit code (design D7).
 #[allow(clippy::too_many_arguments)]
 fn run_import(
     cfg: &config::Config,
@@ -353,65 +665,82 @@ fn run_import(
     json: bool,
 ) -> Result<ExitCode> {
     let profile = resolve_profile(cfg, profile_name, overrides)?;
+    let source_impl = profile.kind.build();
 
-    let scan_progress = progress::Progress::counted(scan_progress_enabled(json), "Scanning");
-    let Some((source_root, import_plan)) =
-        scan_profile(cfg, &profile, source_override, &scan_progress)?
-    else {
-        print_no_sources(profile_name, json);
-        return Ok(ExitCode::Success);
-    };
-
-    if dry_run {
-        print_plan(&import_plan, verbose, &cfg.timezone, json);
-        return Ok(ExitCode::Success);
+    match resolve_effective_sources(
+        &profile,
+        source_override,
+        source_impl.as_ref(),
+        &cfg.mount_roots,
+    )? {
+        EffectiveSources::Explicit(root) => {
+            match run_import_cycle(
+                &profile,
+                source_impl.as_ref(),
+                &root,
+                dry_run,
+                assume_yes,
+                quick_match,
+                &cfg.timezone,
+                verbose,
+                json,
+            )? {
+                ImportDriveOutcome::Empty => {
+                    print_no_sources(profile_name, json);
+                    Ok(ExitCode::Success)
+                }
+                ImportDriveOutcome::Planned(plan) => {
+                    if json {
+                        print_json(&report::plan_to_json(&plan, &cfg.timezone));
+                    }
+                    Ok(ExitCode::Success)
+                }
+                ImportDriveOutcome::Executed { report, any_failed } => {
+                    if json {
+                        print_json(&report::results_to_json(&report));
+                    }
+                    Ok(if any_failed {
+                        ExitCode::Failure
+                    } else {
+                        ExitCode::Success
+                    })
+                }
+            }
+        }
+        EffectiveSources::Multi(drives) => {
+            if drives.is_empty() {
+                print_no_sources(profile_name, json);
+                return Ok(ExitCode::Success);
+            }
+            let results = import_drives(
+                &profile,
+                source_impl.as_ref(),
+                &drives,
+                dry_run,
+                assume_yes,
+                quick_match,
+                &cfg.timezone,
+                verbose,
+                json,
+            );
+            let any_failed = any_import_drive_failed(&results);
+            if json {
+                let json_drives = results
+                    .iter()
+                    .map(|r| report::import_drive_json(&r.name, &r.path, &r.result, &cfg.timezone))
+                    .collect();
+                print_json(&report::MultiImportJson {
+                    drives: json_drives,
+                    any_failed,
+                });
+            }
+            Ok(if any_failed {
+                ExitCode::Failure
+            } else {
+                ExitCode::Success
+            })
+        }
     }
-
-    // A non-dry-run, human-mode import states its intent before
-    // transferring anything (improve-console-output design D4): the
-    // same plan `scan` would print. JSON mode stays a single document
-    // (the execution report) — the spec's one-document contract wins
-    // over symmetry there.
-    if !json {
-        print_plan(&import_plan, verbose, &cfg.timezone, json);
-    }
-
-    // A separate, byte-oriented Progress for the transfer phase (design
-    // D6), built after scanning completes — the scan bar has already
-    // finished and cleared by this point (add-scan-progress design D5).
-    let progress = progress::Progress::new(scan_progress_enabled(json), "Importing");
-
-    let exec_report = transfer::execute(
-        &import_plan,
-        &source_root,
-        profile.delete_source,
-        assume_yes,
-        quick_match,
-        profile.reflink,
-        &progress,
-    )?;
-
-    if json {
-        print_json(&report::results_to_json(&exec_report));
-    } else {
-        print!("{}", report::render_results(&exec_report, verbose));
-    }
-
-    let any_failed = exec_report.groups.iter().any(|g| {
-        g.files
-            .iter()
-            .any(|f| matches!(f.outcome, transfer::TransferOutcome::Failed(_)))
-            || matches!(
-                g.sidecar_outcome,
-                Some(transfer::TransferOutcome::Failed(_))
-            )
-    });
-
-    Ok(if any_failed {
-        ExitCode::Failure
-    } else {
-        ExitCode::Success
-    })
 }
 
 fn parse_older_than(raw: &str) -> Result<jiff::Span> {
